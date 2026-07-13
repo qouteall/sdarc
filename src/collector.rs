@@ -1,7 +1,6 @@
 use crate::reader_critical_section::READER_CRITICAL_SECTION;
-use crate::sdark::{ClearWeakBackRefResult, SdarkInnerFatPtr};
+use crate::sdarc::{ClearWeakBackRefResult, SdarcInnerFatPtr};
 use crate::shard_index::{ShardsArr, shard_indexes};
-use crate::sharded_alloc;
 use crate::sharded_alloc::FULL_SHARD_ALLOC;
 use crossbeam::utils::CachePadded;
 use log::{debug, error};
@@ -22,12 +21,12 @@ pub struct CollectorParams {
 pub(crate) struct CollectorShared {
     params: CollectorParams,
     thread_handle: JoinHandle<()>,
-    /// Every time a new `Sdark` is allocated, it's put into here.
+    /// Every time a new `Sdarc` is allocated, it's put into here.
     /// It's also sharded.
     ///
     /// Why not use [`sharded_alloc::ShardedBox`]: it can only hold 8 bytes per shard,
     /// but Vec is larger than that.
-    pending_to_track: ShardsArr<CachePadded<Mutex<Vec<SdarkInnerFatPtr>>>>,
+    pending_to_track: ShardsArr<CachePadded<Mutex<Vec<SdarcInnerFatPtr>>>>,
     collection_iteration_counter: AtomicU64,
 }
 
@@ -45,13 +44,13 @@ impl CollectorShared {
         }
     }
 
-    fn on_new_sdark_allocated(&self, tc: SdarkInnerFatPtr) {
+    fn on_new_sdarc_allocated(&self, tc: SdarcInnerFatPtr) {
         self.pending_to_track.at_curr_thread_shard().lock().push(tc);
     }
 }
 
-pub(crate) fn on_new_sdark_allocated(fat_ptr: SdarkInnerFatPtr) {
-    get_collector().on_new_sdark_allocated(fat_ptr);
+pub(crate) fn on_new_sdarc_allocated(fat_ptr: SdarcInnerFatPtr) {
+    get_collector().on_new_sdarc_allocated(fat_ptr);
 }
 
 static COLLECTOR: OnceLock<CollectorShared> = OnceLock::new();
@@ -87,7 +86,7 @@ struct CollectorThreadState {
 }
 
 struct TrackedCounter {
-    sdark_fat_ptr: SdarkInnerFatPtr,
+    sdarc_fat_ptr: SdarcInnerFatPtr,
     state: TrackedCounterState,
 }
 
@@ -102,9 +101,9 @@ enum TrackedCounterState {
 }
 
 impl TrackedCounter {
-    fn new(sdark_erased_info: SdarkInnerFatPtr) -> Self {
+    fn new(sdarc_erased_info: SdarcInnerFatPtr) -> Self {
         Self {
-            sdark_fat_ptr: sdark_erased_info,
+            sdarc_fat_ptr: sdarc_erased_info,
             state: TrackedCounterState::CounterSumMayBeNotZero,
         }
     }
@@ -112,10 +111,10 @@ impl TrackedCounter {
     fn update_state(&mut self) {
         match self.state {
             TrackedCounterState::CounterSumMayBeNotZero => {
-                let sum = read_counter_sum(self.sdark_fat_ptr);
+                let sum = read_counter_sum(self.sdarc_fat_ptr);
                 if sum == 0 {
                     let (new_sum, curr_hash) =
-                        read_counter_sum_and_compute_hash(self.sdark_fat_ptr);
+                        read_counter_sum_and_compute_hash(self.sdarc_fat_ptr);
                     if new_sum == 0 {
                         self.state =
                             TrackedCounterState::ObservedCounterSumBeingZeroInOneIteration {
@@ -125,9 +124,9 @@ impl TrackedCounter {
                 }
             }
             TrackedCounterState::ObservedCounterSumBeingZeroInOneIteration { counter_hash } => {
-                let (new_sum, curr_hash) = read_counter_sum_and_compute_hash(self.sdark_fat_ptr);
+                let (new_sum, curr_hash) = read_counter_sum_and_compute_hash(self.sdarc_fat_ptr);
                 if new_sum == 0 && curr_hash == counter_hash {
-                    match self.sdark_fat_ptr.clear_weak_back_ref() {
+                    match self.sdarc_fat_ptr.clear_weak_back_ref() {
                         ClearWeakBackRefResult::WeakRefNotInvolved
                         | ClearWeakBackRefResult::WeakBackRefWasAlreadyNull => {
                             self.state = TrackedCounterState::ReadyToFree;
@@ -149,7 +148,7 @@ impl TrackedCounter {
     }
 }
 
-fn read_counter_sum(fat_ptr: SdarkInnerFatPtr) -> i64 {
+fn read_counter_sum(fat_ptr: SdarcInnerFatPtr) -> i64 {
     let mut sum: i64 = 0;
 
     let counters = unsafe { fat_ptr.get_counters().as_ref() };
@@ -165,7 +164,7 @@ fn read_counter_sum(fat_ptr: SdarkInnerFatPtr) -> i64 {
 }
 
 /// Computing hash is semi-expensive. Only compute hash when counter sum is likely zero.
-fn read_counter_sum_and_compute_hash(fat_ptr: SdarkInnerFatPtr) -> (i64, u64) {
+fn read_counter_sum_and_compute_hash(fat_ptr: SdarcInnerFatPtr) -> (i64, u64) {
     let mut sum: i64 = 0;
     let mut hasher = DefaultHasher::new();
 
@@ -198,14 +197,14 @@ impl CollectorThreadState {
             tracked_counter.update_state();
         }
 
-        let mut to_free: Vec<SdarkInnerFatPtr> = Vec::new();
+        let mut to_free: Vec<SdarcInnerFatPtr> = Vec::new();
 
         self.tracked_counters
             .retain(|tracked_counter| match &tracked_counter.state {
                 TrackedCounterState::CounterSumMayBeNotZero => true,
                 TrackedCounterState::ObservedCounterSumBeingZeroInOneIteration { .. } => true,
                 TrackedCounterState::ReadyToFree => {
-                    to_free.push(tracked_counter.sdark_fat_ptr);
+                    to_free.push(tracked_counter.sdarc_fat_ptr);
                     false
                 }
             });

@@ -1,5 +1,5 @@
 [package]
-name = "sdark"
+name = "sdarc"
 version = "0.1.0"
 edition = "2024"
 description = "Sharded Deferred Atomic Reference Counting"

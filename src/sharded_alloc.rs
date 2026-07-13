@@ -13,8 +13,9 @@ use std::ptr::{NonNull, drop_in_place};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// In mainstream platforms (X86-64 and ARM64), CachePadded use 128 alignment, which is 16 `usize`s.
-const U64_COUNT_PER_SHARD: usize = 16;
+/// Each slot is 8 bytes (same size as `u64`).
+/// In mainstream platforms (X86-64 and ARM64), CachePadded use 128 alignment, which is 16 `u64`s.
+const SLOT_COUNT_PER_SHARD: usize = 16;
 
 pub(crate) struct AllocUnit {
     data_ptr: NonNull<u8>,
@@ -41,7 +42,7 @@ impl AllocUnit {
 
     fn data_len_in_bytes() -> usize {
         // the added 1 is for usage flags. see the svg for structure
-        U64_COUNT_PER_SHARD * (1 + get_shard_count().0 as usize) * 8
+        SLOT_COUNT_PER_SHARD * (1 + get_shard_count().0 as usize) * 8
     }
 
     /// The `index_of_unit` will be used for deallocating.
@@ -88,11 +89,9 @@ impl AllocUnit {
     }
 
     fn allocate_without_initializing<T: Send + Sync>(&self) -> Option<ShardedDataPtr<T>> {
-        // offset_in_shard is in unit of u64
-
         let u64_ptr = self.data_ptr.cast::<u64>();
 
-        for slot_index in 0..U64_COUNT_PER_SHARD {
+        for slot_index in 0..SLOT_COUNT_PER_SHARD {
             let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
             let usage_atomic: &AtomicU64 = unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() };
 
@@ -112,7 +111,7 @@ impl AllocUnit {
     fn is_any_slot_used(&mut self) -> bool {
         let u64_ptr = self.data_ptr.cast::<u64>();
 
-        for slot_index in 0..U64_COUNT_PER_SHARD {
+        for slot_index in 0..SLOT_COUNT_PER_SHARD {
             let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
             let usage_atomic: &AtomicU64 = unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() };
 
@@ -128,8 +127,8 @@ impl AllocUnit {
     fn has_any_free_slot(&self) -> bool {
         let u64_ptr = self.data_ptr.cast::<u64>();
 
-        for offset_in_shard in 0..U64_COUNT_PER_SHARD {
-            let offseted_ptr = unsafe { u64_ptr.offset(offset_in_shard as isize) };
+        for slot_index in 0..SLOT_COUNT_PER_SHARD {
+            let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
             let usage_atomic: &AtomicU64 = unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() };
 
             // Why use Relaxed ordering: this is called within locking. The lock already establish ordering.
@@ -289,7 +288,7 @@ impl<T> ShardedDataPtr<T> {
 
     /// Creating pointer is not unsafe. But using pointer is unsafe.
     pub(crate) fn ptr_at_shard(self, shard_index: ShardIndex) -> NonNull<T> {
-        let offset: usize = U64_COUNT_PER_SHARD * (shard_index.as_usize() + 1);
+        let offset: usize = SLOT_COUNT_PER_SHARD * (shard_index.as_usize() + 1);
 
         let u64_ptr: NonNull<u64> = self.base_ptr.cast::<u64>();
         // Safety: offset is within allocation
