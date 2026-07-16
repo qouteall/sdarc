@@ -8,6 +8,7 @@ use crate::shard_index::{
 use crossbeam::utils::CachePadded;
 use parking_lot::RwLock;
 use scopeguard::guard_on_unwind;
+use std::alloc::{Layout, alloc, dealloc};
 use std::marker::PhantomData;
 use std::ops::{Deref, Index, IndexMut, Not};
 use std::ptr::{NonNull, drop_in_place};
@@ -27,18 +28,35 @@ unsafe impl Send for AllocUnit {}
 unsafe impl Sync for AllocUnit {}
 
 impl AllocUnit {
+    const USAGE_FLAG_UNUSED: u64 = 0;
+    const USAGE_FLAG_USED: u64 = 1;
+
     fn new() -> AllocUnit {
+        let layout = Self::get_layout();
+
+        let ptr: *mut u8 = unsafe { alloc(layout) };
+        let ptr = NonNull::new(ptr).expect("Sharded Alloc Failure");
+
+        // initialize all the usage flags
+        let atomic_u64_ptr = ptr.cast::<AtomicU64>();
+        for slot_index in 0..SLOT_COUNT_PER_SHARD {
+            let usage_flag_ptr = unsafe { atomic_u64_ptr.offset(slot_index as isize) };
+            unsafe {
+                usage_flag_ptr.write(AtomicU64::new(Self::USAGE_FLAG_UNUSED));
+            }
+        }
+
+        AllocUnit { data_ptr: ptr }
+    }
+
+    fn get_layout() -> Layout {
         let len_bytes = Self::data_len_in_bytes();
 
-        let the_box: Box<[u8]> = vec![0u8; len_bytes].into_boxed_slice();
-        let slice_ptr: *mut [u8] = Box::into_raw(the_box);
-        let thin_ptr: *const u8 = unsafe { (*slice_ptr).as_mut_ptr() };
-
-        // the usage flags will also be initialized as 0.
-
-        AllocUnit {
-            data_ptr: NonNull::new(thin_ptr as *mut u8).unwrap(),
-        }
+        let layout = Layout::from_size_align(
+            len_bytes, 8, // align is same as u64
+        )
+        .unwrap();
+        layout
     }
 
     fn data_len_in_bytes() -> usize {
@@ -93,11 +111,13 @@ impl AllocUnit {
 
         for slot_index in 0..SLOT_COUNT_PER_SHARD {
             let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
-            let usage_atomic: &AtomicU64 = unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() };
+            let usage_flag: &AtomicU64 = unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() };
 
             /// The Acquire ordering synchronizes-with Release ordering in
             /// [`ShardedDataPtr::deallocate_without_dropping`]
-            if usage_atomic.swap(1, Ordering::Acquire) == 0 {
+            let old_usage_flag_value = usage_flag.swap(Self::USAGE_FLAG_USED, Ordering::Acquire);
+            Self::assert_usage_flag_value_valid(old_usage_flag_value);
+            if old_usage_flag_value == Self::USAGE_FLAG_UNUSED {
                 let sharded_data_ptr = ShardedDataPtr::new(offseted_ptr);
                 return Some(sharded_data_ptr);
             }
@@ -106,38 +126,36 @@ impl AllocUnit {
         None
     }
 
-    /// Intentionally take mut self
-    #[allow(clippy::wrong_self_convention)]
-    fn is_any_slot_used(&mut self) -> bool {
+    #[allow(clippy::needless_lifetimes)]
+    fn usage_flag_atomics<'a>(&'a self) -> impl Iterator<Item = &'a AtomicU64> {
         let u64_ptr = self.data_ptr.cast::<u64>();
 
-        for slot_index in 0..SLOT_COUNT_PER_SHARD {
-            let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
-            let usage_atomic: &AtomicU64 = unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() };
+        (0..SLOT_COUNT_PER_SHARD)
+            .into_iter()
+            .map(move |slot_index| {
+                let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
+                unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() }
+            })
+    }
 
-            // Why use Relaxed ordering: this is called within write lock. The lock already establish ordering.
-            if usage_atomic.load(Ordering::Relaxed) == 1 {
-                return true;
-            }
-        }
-
-        return false;
+    fn is_any_slot_used(&self) -> bool {
+        self.usage_flag_atomics().any(|usage_flag| {
+            let usage_flag_value = usage_flag.load(Ordering::Relaxed);
+            Self::assert_usage_flag_value_valid(usage_flag_value);
+            usage_flag_value == Self::USAGE_FLAG_USED
+        })
     }
 
     fn has_any_free_slot(&self) -> bool {
-        let u64_ptr = self.data_ptr.cast::<u64>();
+        self.usage_flag_atomics().any(|usage_flag| {
+            let usage_flag_value = usage_flag.load(Ordering::Relaxed);
+            Self::assert_usage_flag_value_valid(usage_flag_value);
+            usage_flag_value == Self::USAGE_FLAG_UNUSED
+        })
+    }
 
-        for slot_index in 0..SLOT_COUNT_PER_SHARD {
-            let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
-            let usage_atomic: &AtomicU64 = unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() };
-
-            // Why use Relaxed ordering: this is called within locking. The lock already establish ordering.
-            if usage_atomic.load(Ordering::Relaxed) == 0 {
-                return true;
-            }
-        }
-
-        return false;
+    fn assert_usage_flag_value_valid(value: u64) {
+        assert!(value == 0 || value == 1);
     }
 }
 
@@ -145,25 +163,22 @@ impl Drop for AllocUnit {
     fn drop(&mut self) {
         assert!(self.is_any_slot_used().not());
 
-        let len = Self::data_len_in_bytes();
-        let slice_ptr: *mut [u8] = std::ptr::slice_from_raw_parts_mut(self.data_ptr.as_ptr(), len);
-
-        // Safety: ownership ensures no dangling and no double free
-        let the_box: Box<[u8]> = unsafe { Box::from_raw(slice_ptr) };
-        drop(the_box);
+        unsafe {
+            dealloc(self.data_ptr.as_ptr(), Self::get_layout());
+        }
     }
 }
 
 pub(crate) struct ShardOfShardAlloc {
     all_units: Vec<AllocUnit>,
-    index_of_units_to_check_for_allocation: Vec<usize>,
+    indexes_of_units_to_check_for_allocation: Vec<usize>,
 }
 
 impl ShardOfShardAlloc {
     fn new() -> ShardOfShardAlloc {
         ShardOfShardAlloc {
             all_units: Vec::new(),
-            index_of_units_to_check_for_allocation: Vec::new(),
+            indexes_of_units_to_check_for_allocation: Vec::new(),
         }
     }
 
@@ -172,7 +187,7 @@ impl ShardOfShardAlloc {
         &self,
         init_func: impl Fn(ShardIndex) -> T,
     ) -> Option<ShardedDataPtr<T>> {
-        for i in &self.index_of_units_to_check_for_allocation {
+        for i in &self.indexes_of_units_to_check_for_allocation {
             let i = *i;
             let unit = &self.all_units[i];
             if let Some(p) = unit.allocate_and_initialize::<T>(&init_func) {
@@ -194,7 +209,7 @@ impl ShardOfShardAlloc {
             .expect("New unit should not fail allocation");
 
         self.all_units.push(new_unit);
-        self.index_of_units_to_check_for_allocation
+        self.indexes_of_units_to_check_for_allocation
             .push(self.all_units.len() - 1);
         ptr
     }
@@ -202,11 +217,11 @@ impl ShardOfShardAlloc {
     fn do_maintenance(&mut self) {
         self.all_units.retain_mut(|unit| unit.is_any_slot_used());
 
-        self.index_of_units_to_check_for_allocation.clear();
+        self.indexes_of_units_to_check_for_allocation.clear();
 
         for (i, unit) in self.all_units.iter().enumerate() {
             if unit.has_any_free_slot() {
-                self.index_of_units_to_check_for_allocation.push(i);
+                self.indexes_of_units_to_check_for_allocation.push(i);
             }
         }
     }

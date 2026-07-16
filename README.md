@@ -1,6 +1,6 @@
 (This repo is work-in-progress)
 
-# Sharded-Deferred-Arc
+# Sharded Deferred Atomic Reference Counting (sdarc)
 
 `Arc` is commonly used in Rust. But when many threads increment/decrement same atomic counter, cache contention may hurt performance.
 
@@ -21,5 +21,6 @@ This library doesn't suit these use ases:
 
 - If `Arc` atomic counter contention is low (there won't be many threads increment/decrement same counter in parallel), don't use this library.
 - If you want it to drop content immediately when strong reference count goes 0. (Collecting a deep structure drops layer-by-layer, so it may take long time to fully drop.)
+- For millions of small object, don't use `Sdarc`. It's recommended to put them into an arena. The arena can be held in `Sdarc`.
 - This library doesn't support no_std.
 

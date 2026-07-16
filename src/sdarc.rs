@@ -293,8 +293,8 @@ impl<T> AtomicNullableSdarc<T> {
     pub fn swap(&self, sdarc: Option<Sdarc<T>>) -> Option<Sdarc<T>> {
         let new_ptr = Sdarc::nullable_into_raw_ptr(sdarc);
 
-        /// Why use AckRel ordering: synchronize-with [`Self::load`]'s loading pointer in Acquire ordering.
-        /// The thread calling [`AtomicNullableSdarc::load`] should observe all mutations to the content pointed by `new_ptr`.
+        /// Why use AcqRel ordering: synchronize-with [`Self::load`]'s loading pointer in Acquire ordering.
+        /// The thread calling [`Self::load`] should observe all mutations to the content pointed by `new_ptr`.
         /// The old pointer is returned, so if user code uses the swapped-out Sdarc,
         /// later user code observes all mutations before the pointer writer writes the old pointer.
         /// (It involves reads/writes in user code, not in current library).
@@ -307,7 +307,7 @@ impl<T> AtomicNullableSdarc<T> {
     pub fn store(&self, sdarc: Option<Sdarc<T>>) {
         let new_ptr = Sdarc::nullable_into_raw_ptr(sdarc);
 
-        /// Why use Release ordering, but the [`AtomicSdarc::swap`] uses AckRel:
+        /// Why use Release ordering, but the [`Self::swap`] uses AcqRel:
         /// The old pointer is dropped rather than returned.
         /// No user code could depend on anything from the old pointer.
         /// The reference count decrement is synchronized with collector in other ways.
@@ -390,7 +390,7 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     }
 
     pub fn store(&self, new_sdarc: Sdarc<T>) {
-        self.store(new_sdarc);
+        self.0.store(Some(new_sdarc));
     }
 
     /// If the pointer matches `if_matches`, it succeeds and sets pointer. In that case it returns Ok containing the original `Sdarc` (it points to the same as `if_matches`).
