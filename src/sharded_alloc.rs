@@ -3,6 +3,7 @@
 
 use crate::shard_index::{
     ShardIndex, ShardsArr, curr_thread_shard_index, get_shard_count, shard_indexes,
+    shard_indexes_until,
 };
 use crossbeam::utils::CachePadded;
 use parking_lot::RwLock;
@@ -61,9 +62,8 @@ impl AllocUnit {
                     let _unwind_guard = guard_on_unwind((), |()| {
                         // the `init_func` can panic.
                         // when it panics, drop the already-written values and de-allocate
-                        for shard_index_to_drop in 0..shard_index.as_8() {
-                            let shard_index_to_drop =
-                                ShardIndex::from_bounded_u8(shard_index_to_drop);
+
+                        for shard_index_to_drop in shard_indexes_until(shard_index) {
                             let ele_ptr_to_drop: NonNull<T> =
                                 sharded_data_ptr.ptr_at_shard(shard_index_to_drop);
                             unsafe {

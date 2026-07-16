@@ -38,8 +38,21 @@ impl<T: Send + Sync> ShardedRwLock<T> {
         }
     }
 
+    pub fn try_read<'a>(&'a self) -> Option<ReadGuardOfShardedRwLock<'a, T>> {
+        let lock_shard: &RwLock<()> = self.locks.at_curr_thread_shard();
+
+        if let Some(guard) = lock_shard.try_read() {
+            Some(ReadGuardOfShardedRwLock {
+                _raw_guard: guard,
+                cell_ref: &self.data,
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn write<'a>(&'a self) -> WriteGuardOfShardedRwLock<'a, T> {
-        // this loop cannot panic as far as I know, so no need to consider half-locked state
+        // this loop cannot panic (parking_lot write doesn't panic), so no need to consider half-locked state
         for shard_index in shard_indexes() {
             let lock_ref: &RwLock<()> = &self.locks[shard_index];
             let guard = lock_ref.write();

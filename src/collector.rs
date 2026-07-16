@@ -1,17 +1,16 @@
 use crate::reader_critical_section::READER_CRITICAL_SECTION;
 use crate::sdarc::{ClearWeakBackRefResult, SdarcInnerFatPtr};
-use crate::shard_index::{ShardsArr, shard_indexes};
+use crate::shard_index::{shard_indexes, ShardsArr};
 use crate::sharded_alloc::FULL_SHARD_ALLOC;
 use crossbeam::utils::CachePadded;
 use log::{debug, error};
 use parking_lot::Mutex;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::ops::Deref;
-use std::sync::OnceLock;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use std::{panic, thread};
+use std::{mem, panic, thread};
 
 #[derive(Debug, Clone)]
 pub struct CollectorParams {
@@ -26,26 +25,54 @@ pub(crate) struct CollectorShared {
     ///
     /// Why not use [`sharded_alloc::ShardedBox`]: it can only hold 8 bytes per shard,
     /// but Vec is larger than that.
-    pending_to_track: ShardsArr<CachePadded<Mutex<Vec<SdarcInnerFatPtr>>>>,
+    pending_to_track: ShardsArr<CachePadded<Mutex<CollectorPendingDataShard>>>,
+
     collection_iteration_counter: AtomicU64,
+}
+
+pub(crate) struct CollectorPendingDataShard {
+    new_counters_to_track: Vec<SdarcInnerFatPtr>,
+}
+
+impl CollectorPendingDataShard {
+    pub fn new() -> CollectorPendingDataShard {
+        Self {
+            new_counters_to_track: Vec::new(),
+        }
+    }
 }
 
 impl CollectorShared {
     fn new(params: CollectorParams) -> Self {
         Self {
             params,
-            thread_handle: thread::spawn(move || collector_thread_main()),
+            thread_handle: thread::spawn(move || {
+                let r = panic::catch_unwind(|| collector_thread_main());
+                match r {
+                    Ok(()) => {
+                        error!("Collector main should not finish.")
+                    }
+                    Err(err) => {
+                        error!("Collector panicked {err:?}");
+                        eprintln!("Collector panicked {err:?}");
+                    }
+                }
+            }),
             // The CachePadded ensure the rwlock and vec's outer 3 fields (ptr, length and capacity) are in unique cache lines.
             // The 8 ensures initial inner spaces are in unique cache lines.
             pending_to_track: ShardsArr::new(|_| {
-                CachePadded::new(Mutex::new(Vec::with_capacity(8)))
+                CachePadded::new(Mutex::new(CollectorPendingDataShard::new()))
             }),
             collection_iteration_counter: AtomicU64::new(0),
         }
     }
 
-    fn on_new_sdarc_allocated(&self, tc: SdarcInnerFatPtr) {
-        self.pending_to_track.at_curr_thread_shard().lock().push(tc);
+    fn on_new_sdarc_allocated(&self, fat_ptr: SdarcInnerFatPtr) {
+        self.pending_to_track
+            .at_curr_thread_shard()
+            .lock()
+            .new_counters_to_track
+            .push(fat_ptr);
     }
 }
 
@@ -60,6 +87,12 @@ static DEFAULT_PARAM: CollectorParams = CollectorParams {
 };
 
 /// Return false if the collector have already been initialized. The collector can only be initialized once.
+///
+/// Normal users don't need to call this. When the first `Sdarc` is being created, collector will be initialized,
+/// and collector thread will be spawned.
+///
+/// Only call it if you want to change collector param to be non-default value. And it should be called eariler
+/// than creating any Sdarc. Once it has been initialized, param cannot change.
 pub fn try_init_collector(params: CollectorParams) -> bool {
     let mut is_new_init = false;
     COLLECTOR.get_or_init(|| {
@@ -90,13 +123,9 @@ struct TrackedCounter {
     state: TrackedCounterState,
 }
 
-enum TrackedCounterState {
-    CounterSumMayBeNotZero,
-    /// To compare whether previous counters equal current counters, we use hash comparison to avoid allocation.
-    /// It uses [`DefaultHasher`] which is `SipHasher13`, which is collision-resistant enough.
-    ObservedCounterSumBeingZeroInOneIteration {
-        counter_hash: u64,
-    },
+pub(crate) enum TrackedCounterState {
+    DefaultState,
+    RequiresReChecking,
     ReadyToFree,
 }
 
@@ -104,80 +133,137 @@ impl TrackedCounter {
     fn new(sdarc_erased_info: SdarcInnerFatPtr) -> Self {
         Self {
             sdarc_fat_ptr: sdarc_erased_info,
-            state: TrackedCounterState::CounterSumMayBeNotZero,
+            state: TrackedCounterState::DefaultState,
         }
     }
 
     fn update_state(&mut self) {
         match self.state {
-            TrackedCounterState::CounterSumMayBeNotZero => {
-                let sum = read_counter_sum(self.sdarc_fat_ptr);
-                if sum == 0 {
-                    let (new_sum, curr_hash) =
-                        read_counter_sum_and_compute_hash(self.sdarc_fat_ptr);
-                    if new_sum == 0 {
-                        self.state =
-                            TrackedCounterState::ObservedCounterSumBeingZeroInOneIteration {
-                                counter_hash: curr_hash,
-                            };
+            TrackedCounterState::DefaultState => {
+                let relaxed_sum = read_ref_count_sum_relaxed(self.sdarc_fat_ptr);
+                if relaxed_sum == 0 {
+                    let sum = clear_tags_and_read_ref_count_sum_relaxed(self.sdarc_fat_ptr);
+                    if sum == 0 {
+                        self.state = TrackedCounterState::RequiresReChecking;
+                    } else {
+                        // The observed counter sum changed from 0 to nonzero.
+                        // It's normal because there are race conditions.
+                        // It stays in default state.
+                        // There is side effect that counter tags are cleared. No need to re-set tags.
+                        // Because after observing counter sum being 0 again tags will be re-cleared.
                     }
                 }
             }
-            TrackedCounterState::ObservedCounterSumBeingZeroInOneIteration { counter_hash } => {
-                let (new_sum, curr_hash) = read_counter_sum_and_compute_hash(self.sdarc_fat_ptr);
-                if new_sum == 0 && curr_hash == counter_hash {
-                    match self.sdarc_fat_ptr.clear_weak_back_ref() {
-                        ClearWeakBackRefResult::WeakRefNotInvolved
-                        | ClearWeakBackRefResult::WeakBackRefWasAlreadyNull => {
-                            self.state = TrackedCounterState::ReadyToFree;
-                        }
-                        ClearWeakBackRefResult::WeakBackRefCleared => {
-                            // re-check counter because upgrade may happen in parallel.
-                            // but after the weak back ref has been cleared, upgrade can no longer happen.
-                            self.state = TrackedCounterState::CounterSumMayBeNotZero;
+            TrackedCounterState::RequiresReChecking => {
+                let opt_sum = read_ref_count_sum_if_all_tags_unset_acquire(self.sdarc_fat_ptr);
+                match opt_sum {
+                    None => {
+                        // Observed that some tag is set. There is counter decrement in between.
+                        // Go back to default state.
+                        self.state = TrackedCounterState::DefaultState;
+                    }
+                    Some(sum) => {
+                        if sum == 0 {
+                            // At here we are confident that strong count sum reaches zero.
+                            // However, weak reference upgrade may happen in parallel.
+                            // so clear the weak backref so upgrade can no longer happen.
+                            match self.sdarc_fat_ptr.clear_weak_back_ref() {
+                                ClearWeakBackRefResult::WeakRefNotInvolved
+                                | ClearWeakBackRefResult::WeakBackRefWasAlreadyNull => {
+                                    // weak backref doesn't exist or was already cleared, ready to free
+                                    self.state = TrackedCounterState::ReadyToFree;
+                                }
+                                ClearWeakBackRefResult::WeakBackRefCleared => {
+                                    // Weak backref is cleared, upgrade can no longer happen,
+                                    // but an upgrade may happen in parallel with clearing of weak backref
+                                    // under reader critical section,
+                                    // so re-check in next iteration of collection, which syncs
+                                    // with reader critical section.
+                                    self.state = TrackedCounterState::RequiresReChecking;
+                                }
+                            }
+                        } else {
+                            assert!(
+                                sum > 0,
+                                "In RequiresReChecking state, no tag is set, then counter sum should not be negative"
+                            );
+
+                            // No tag is set but counter sum is not zero
+                            // Go back to default state.
+                            self.state = TrackedCounterState::DefaultState;
                         }
                     }
-                } else {
-                    self.state = TrackedCounterState::CounterSumMayBeNotZero;
                 }
             }
             TrackedCounterState::ReadyToFree => {
-                // No need to update
+                panic!("In state ReadyToFree, update_state should not be called")
             }
         }
     }
 }
 
-fn read_counter_sum(fat_ptr: SdarcInnerFatPtr) -> i64 {
+/// It uses Relaxed ordering to read counter sum.
+/// Only when its result is 0 does counter sum be re-read using Acquire ordering.
+///
+/// In most cases, collector will see non-zero sum so this can improve collector performance.
+fn read_ref_count_sum_relaxed(fat_ptr: SdarcInnerFatPtr) -> i64 {
     let mut sum: i64 = 0;
 
     let counters = unsafe { fat_ptr.get_counters().as_ref() };
 
     for shard_index in shard_indexes() {
-        // Why use Acquire ordering: the decrementing of counter use Release.
-        // It synchronizes-with decrementing of counter which use Release.
-        let counter = counters[shard_index].load(Ordering::Acquire);
-        sum += counter;
+        // Why use Relaxed ordering: it's just a pre-check
+        let tagged_counter = counters[shard_index].load_relaxed();
+        sum += tagged_counter.ref_count();
     }
 
     sum
 }
 
-/// Computing hash is semi-expensive. Only compute hash when counter sum is likely zero.
-fn read_counter_sum_and_compute_hash(fat_ptr: SdarcInnerFatPtr) -> (i64, u64) {
+fn clear_tags_and_read_ref_count_sum_relaxed(fat_ptr: SdarcInnerFatPtr) -> i64 {
     let mut sum: i64 = 0;
-    let mut hasher = DefaultHasher::new();
 
     let counters = unsafe { fat_ptr.get_counters().as_ref() };
 
     for shard_index in shard_indexes() {
-        // Why use Acquire ordering: see `read_counter_sum`
-        let counter = counters[shard_index].load(Ordering::Acquire);
-        sum += counter;
-        counter.hash(&mut hasher);
+        /// Why use Relaxed ordering: the [`read_ref_count_sum_if_all_tags_unset_acquire`]
+        /// during re-check ensures correctness.
+        let tagged_counter = counters[shard_index].fetch_and_clear_tag_relaxed();
+        sum += tagged_counter.ref_count();
     }
 
-    (sum, hasher.finish())
+    sum
+}
+
+/// If all tags are unset, returns Some containing counter sum
+/// If one tag is set, return None
+///
+/// It uses Acquire ordering to read.
+///
+/// If there is decrement in parallel:
+/// - If it observes decrement, then it observes tag being set, then collection will be delayed.
+/// - If it doesn't observe decrement, it will observe counter sum higher than zero, so collection will still be delayed.
+///
+/// If there is increment in parallel:
+/// - If the increment comes from existing strong reference, as increment happens-before decrement,
+///   it cannot observe zero sum.
+/// - If the increment comes from loading atomic pointer or weak ref upgrade,
+///   reader critical section will ensure collector observes incremented counter.
+fn read_ref_count_sum_if_all_tags_unset_acquire(fat_ptr: SdarcInnerFatPtr) -> Option<i64> {
+    let mut sum: i64 = 0;
+
+    let counters = unsafe { fat_ptr.get_counters().as_ref() };
+
+    for shard_index in shard_indexes() {
+        // Why use Acquire ordering: see function doc
+        let tagged_counter = counters[shard_index].load_acquire();
+        if tagged_counter.tag() {
+            return None;
+        }
+        sum += tagged_counter.ref_count();
+    }
+
+    Some(sum)
 }
 
 impl CollectorThreadState {
@@ -187,12 +273,12 @@ impl CollectorThreadState {
         // This is important
         READER_CRITICAL_SECTION.spin_until_observing_non_critical_section_once_in_each_shard();
 
-        self.update_tracked_counters();
+        self.update_tracked_counters_and_collect();
 
         FULL_SHARD_ALLOC.do_maintenance();
     }
 
-    fn update_tracked_counters(&mut self) {
+    fn update_tracked_counters_and_collect(&mut self) {
         for tracked_counter in &mut self.tracked_counters {
             tracked_counter.update_state();
         }
@@ -201,8 +287,8 @@ impl CollectorThreadState {
 
         self.tracked_counters
             .retain(|tracked_counter| match &tracked_counter.state {
-                TrackedCounterState::CounterSumMayBeNotZero => true,
-                TrackedCounterState::ObservedCounterSumBeingZeroInOneIteration { .. } => true,
+                TrackedCounterState::DefaultState => true,
+                TrackedCounterState::RequiresReChecking => true,
                 TrackedCounterState::ReadyToFree => {
                     to_free.push(tracked_counter.sdarc_fat_ptr);
                     false
@@ -220,11 +306,22 @@ impl CollectorThreadState {
         }
     }
 
+    /// It uses locking. The locking ensures that when it starts tracking a `SdarcInner`,
+    /// so the collector won't observe uninitialized counter or uninitialized pointee.
     fn take_new_counters_to_track(&mut self) {
         for shard_index in shard_indexes() {
-            let mut guard = self.collector.pending_to_track[shard_index].deref().lock();
-            self.tracked_counters
-                .extend(guard.drain(0..).map(|info| TrackedCounter::new(info)));
+            // Use empty container to replace it, minimize time of taking lock
+            let taken = {
+                let mut guard = self.collector.pending_to_track[shard_index].deref().lock();
+                mem::replace(guard.deref_mut(), CollectorPendingDataShard::new())
+            };
+
+            self.tracked_counters.extend(
+                taken
+                    .new_counters_to_track
+                    .into_iter()
+                    .map(|fat_ptr| TrackedCounter::new(fat_ptr)),
+            );
         }
     }
 }

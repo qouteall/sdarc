@@ -23,7 +23,18 @@ fn init_shard_count() -> ShardCount {
         .map(|n| n.get())
         .unwrap_or(1);
 
-    let num = min(available_parallelism, MAX_SHARD_COUNT);
+    assert_ne!(available_parallelism, 0);
+
+    // Use 1.5 times of available parallelism.
+    // Because that, by default, shard index is determined by thread id hash mod shard count.
+    // If there are N cores, and there are N currently-running threads, some worker thread's shard index may collide,
+    // which increase contention.
+    // So increase shard count to reduce chance of contention.
+    // Also note that the collision can also be avoided by user manually calling `set_current_thread_shard_index`,
+    // we still increase shard count to reduce contention out-of-the-box.
+    let adjusted = available_parallelism + available_parallelism / 2;
+
+    let num = min(adjusted, MAX_SHARD_COUNT);
 
     ShardCount(num as u16)
 }
@@ -50,7 +61,7 @@ impl ShardIndex {
     }
 
     pub fn from_bounded_u8(value: u8) -> Self {
-        assert!((value as u64) < (get_shard_count().0 as u64));
+        assert!((value as u16) < (get_shard_count().0));
         Self(value)
     }
 
@@ -92,6 +103,11 @@ pub fn shard_indexes() -> impl Iterator<Item = ShardIndex> {
     (0..get_shard_count().0)
         .into_iter()
         .map(|i| ShardIndex(i as u8))
+}
+
+pub fn shard_indexes_until(shard_index: ShardIndex) -> impl Iterator<Item = ShardIndex> {
+    assert!((shard_index.0 as u16) <= get_shard_count().0);
+    (0..shard_index.0).into_iter().map(|i| ShardIndex(i as u8))
 }
 
 /// A helper type that wraps heap-allocated slice so that you can use ShardIndex as index. The user no longer need to convert ShardIndex to usize.
