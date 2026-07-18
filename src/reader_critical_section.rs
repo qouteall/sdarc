@@ -35,7 +35,7 @@
 //! then writer mutates the pointer and drops the original `Sdarc`,
 //! then collector sees ref counter sum being 0. However, it requires two iterations of collector
 //! to free the memory. So memory is not freed at that time.
-//! In the next collector interation,
+//! In the next collector iteration,
 //! collector will spin until observing each critical section counter becomes zero again.
 //! If reader thread is still un-scheduled,
 //! collector will wait until that reader thread is scheduled and finish reader critical section.

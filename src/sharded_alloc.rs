@@ -6,18 +6,20 @@ use crate::shard_index::{
     shard_indexes_until,
 };
 use crossbeam::utils::CachePadded;
-use parking_lot::RwLock;
+use log::trace;
+use parking_lot::{Mutex, RwLock};
 use scopeguard::guard_on_unwind;
 use std::alloc::{Layout, alloc, dealloc};
 use std::marker::PhantomData;
-use std::ops::{Deref, Index, IndexMut, Not};
+use std::mem;
+use std::ops::{Deref, DerefMut, Index, IndexMut, Not};
 use std::ptr::{NonNull, drop_in_place};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Each slot is 8 bytes (same size as `u64`).
 /// In mainstream platforms (X86-64 and ARM64), CachePadded use 128 alignment, which is 16 `u64`s.
-const SLOT_COUNT_PER_SHARD: usize = 16;
+const SLOT_COUNT_PER_UNIT: usize = 16;
 
 pub(crate) struct AllocUnit {
     data_ptr: NonNull<u8>,
@@ -39,7 +41,7 @@ impl AllocUnit {
 
         // initialize all the usage flags
         let atomic_u64_ptr = ptr.cast::<AtomicU64>();
-        for slot_index in 0..SLOT_COUNT_PER_SHARD {
+        for slot_index in 0..SLOT_COUNT_PER_UNIT {
             let usage_flag_ptr = unsafe { atomic_u64_ptr.offset(slot_index as isize) };
             unsafe {
                 usage_flag_ptr.write(AtomicU64::new(Self::USAGE_FLAG_UNUSED));
@@ -61,7 +63,7 @@ impl AllocUnit {
 
     fn data_len_in_bytes() -> usize {
         // the added 1 is for usage flags. see the svg for structure
-        SLOT_COUNT_PER_SHARD * (1 + get_shard_count().0 as usize) * 8
+        SLOT_COUNT_PER_UNIT * (1 + get_shard_count().0 as usize) * 8
     }
 
     /// The `index_of_unit` will be used for deallocating.
@@ -109,7 +111,7 @@ impl AllocUnit {
     fn allocate_without_initializing<T: Send + Sync>(&self) -> Option<ShardedDataPtr<T>> {
         let u64_ptr = self.data_ptr.cast::<u64>();
 
-        for slot_index in 0..SLOT_COUNT_PER_SHARD {
+        for slot_index in 0..SLOT_COUNT_PER_UNIT {
             let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
             let usage_flag: &AtomicU64 = unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() };
 
@@ -130,12 +132,10 @@ impl AllocUnit {
     fn usage_flag_atomics<'a>(&'a self) -> impl Iterator<Item = &'a AtomicU64> {
         let u64_ptr = self.data_ptr.cast::<u64>();
 
-        (0..SLOT_COUNT_PER_SHARD)
-            .into_iter()
-            .map(move |slot_index| {
-                let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
-                unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() }
-            })
+        (0..SLOT_COUNT_PER_UNIT).into_iter().map(move |slot_index| {
+            let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
+            unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() }
+        })
     }
 
     fn is_any_slot_used(&self) -> bool {
@@ -157,6 +157,13 @@ impl AllocUnit {
     fn assert_usage_flag_value_valid(value: u64) {
         assert!(value == 0 || value == 1);
     }
+
+    // just used for trace logging
+    fn get_unused_slot_count(&self) -> usize {
+        self.usage_flag_atomics()
+            .filter(|usage_flag| usage_flag.load(Ordering::Relaxed) == Self::USAGE_FLAG_UNUSED)
+            .count()
+    }
 }
 
 impl Drop for AllocUnit {
@@ -169,49 +176,49 @@ impl Drop for AllocUnit {
     }
 }
 
-pub(crate) struct ShardOfShardAlloc {
+/// There one group per shard. There is another group for temporary-filling which aim to reduce maintenance lock time.
+pub(crate) struct AllocUnitGroup {
     all_units: Vec<AllocUnit>,
+
+    /// The [`ShardedDataPtr::deallocate_without_dropping`] just changes usage flag.
+    /// It requires collector to do periodic maintenance to put partially-empty units' indexes back into this.
     indexes_of_units_to_check_for_allocation: Vec<usize>,
 }
 
-impl ShardOfShardAlloc {
-    fn new() -> ShardOfShardAlloc {
-        ShardOfShardAlloc {
+impl AllocUnitGroup {
+    fn new() -> AllocUnitGroup {
+        AllocUnitGroup {
             all_units: Vec::new(),
             indexes_of_units_to_check_for_allocation: Vec::new(),
         }
     }
 
-    /// It only requires read lock. It can set atomic usage flag to true, but cannot change the memory layout.
-    fn allocate_from_existing_units<T: Send + Sync>(
-        &self,
-        init_func: impl Fn(ShardIndex) -> T,
-    ) -> Option<ShardedDataPtr<T>> {
-        for i in &self.indexes_of_units_to_check_for_allocation {
-            let i = *i;
-            let unit = &self.all_units[i];
-            if let Some(p) = unit.allocate_and_initialize::<T>(&init_func) {
-                return Some(p);
-            }
-        }
-
-        None
-    }
-
-    fn allocate_using_new_unit<T: Send + Sync>(
+    fn allocate<T: Send + Sync>(
         &mut self,
         init_func: impl Fn(ShardIndex) -> T,
     ) -> ShardedDataPtr<T> {
-        let new_unit = AllocUnit::new();
+        loop {
+            if self.indexes_of_units_to_check_for_allocation.is_empty() {
+                let new_unit = AllocUnit::new();
 
-        let ptr: ShardedDataPtr<T> = new_unit
-            .allocate_and_initialize(init_func)
-            .expect("New unit should not fail allocation");
+                let ptr: ShardedDataPtr<T> = new_unit
+                    .allocate_and_initialize(&init_func)
+                    .expect("New unit should not fail allocation");
 
-        self.all_units.push(new_unit);
-        self.indexes_of_units_to_check_for_allocation
-            .push(self.all_units.len() - 1);
-        ptr
+                self.all_units.push(new_unit);
+                self.indexes_of_units_to_check_for_allocation
+                    .push(self.all_units.len() - 1);
+                return ptr;
+            }
+
+            let unit_index = self.indexes_of_units_to_check_for_allocation[0];
+            let unit = &self.all_units[unit_index];
+            if let Some(ptr) = unit.allocate_and_initialize(&init_func) {
+                return ptr;
+            } else {
+                self.indexes_of_units_to_check_for_allocation.swap_remove(0);
+            }
+        }
     }
 
     fn do_maintenance(&mut self) {
@@ -225,17 +232,40 @@ impl ShardOfShardAlloc {
             }
         }
     }
+
+    // Only used in trace logging
+    fn count_unused_slot_count_and_all_slot_count(&self) -> (usize, usize) {
+        let unused_slot_count: usize = self
+            .all_units
+            .iter()
+            .map(|unit| unit.get_unused_slot_count())
+            .sum();
+        let all_slot_count = self.all_units.len() * SLOT_COUNT_PER_UNIT;
+
+        (unused_slot_count, all_slot_count)
+    }
 }
 
 pub(crate) struct FullShardAlloc {
-    shards: ShardsArr<CachePadded<RwLock<ShardOfShardAlloc>>>,
+    shards_to_allocate: ShardsArr<CachePadded<RwLock<AllocUnitGroup>>>,
+
+    /// The collector will do maintenance for each group.
+    /// But maintenance is O(n) and maintenance takes lock.
+    /// For collector, O(n) is fine, but for allocation we want to avoid blocking too long.
+    /// The solution is to firstly swap this temp filling group then do maintenance then swap back.
+    /// Then collector only briefly hold mutex for swapping.
+    /// This mutex will only be held by collector.
+    temp_filling_group: Mutex<AllocUnitGroup>,
 }
 
 impl FullShardAlloc {
     fn initialize() -> FullShardAlloc {
         let shards =
-            ShardsArr::new(|_shard_index| CachePadded::new(RwLock::new(ShardOfShardAlloc::new())));
-        FullShardAlloc { shards }
+            ShardsArr::new(|_shard_index| CachePadded::new(RwLock::new(AllocUnitGroup::new())));
+        FullShardAlloc {
+            shards_to_allocate: shards,
+            temp_filling_group: Mutex::new(AllocUnitGroup::new()),
+        }
     }
 
     fn allocate_and_init<T: Send + Sync>(
@@ -243,27 +273,72 @@ impl FullShardAlloc {
         init_func: impl Fn(ShardIndex) -> T,
     ) -> ShardedDataPtr<T> {
         let shard_index = curr_thread_shard_index();
-        let shard = &self.shards[shard_index];
-        let lock: &RwLock<ShardOfShardAlloc> = shard.deref();
+        let shard = &self.shards_to_allocate[shard_index];
 
-        // Firstly try to allocate under read lock. If failed, then allocate under write lock.
-        {
-            let g = lock.read();
-            if let Some(p) = g.allocate_from_existing_units::<T>(&init_func) {
-                return p;
+        let mut g = shard.write();
+        g.allocate::<T>(&init_func)
+    }
+
+    pub(crate) fn do_maintenance_by_collector(&self) {
+        let mut filling_group_guard = self.temp_filling_group.lock();
+
+        for shard_index in shard_indexes() {
+            let shard = &self.shards_to_allocate[shard_index];
+
+            // swap with the filling group, then do maintenance, then swap back.
+            // the maintenance is O(n). this ensures collector doing maintenance won't block allocation for long time
+            {
+                let mut shard_group_guard = shard.write();
+                mem::swap(
+                    shard_group_guard.deref_mut(),
+                    filling_group_guard.deref_mut(),
+                );
+            }
+
+            filling_group_guard.do_maintenance();
+
+            {
+                let mut shard_group_guard = shard.write();
+                mem::swap(
+                    shard_group_guard.deref_mut(),
+                    filling_group_guard.deref_mut(),
+                );
             }
         }
 
-        let mut g = lock.write();
-        g.allocate_using_new_unit(&init_func)
+        filling_group_guard.do_maintenance();
     }
 
-    pub(crate) fn do_maintenance(&self) {
+    pub(crate) fn log_status_in_trace_level(&self) {
+        let mut total_unused_slot_count = 0;
+        let mut total_slot_count = 0;
+
         for shard_index in shard_indexes() {
-            let shard = &self.shards[shard_index];
-            let lock: &RwLock<ShardOfShardAlloc> = shard.deref();
-            let mut guard = lock.write();
-            guard.do_maintenance();
+            let shard = &self.shards_to_allocate[shard_index];
+            let guard = shard.write();
+            let (unused_slot_count, slot_count) =
+                guard.count_unused_slot_count_and_all_slot_count();
+            trace!("ShardedAllocator {shard_index:?} unused {unused_slot_count} all {slot_count}");
+            total_unused_slot_count += unused_slot_count;
+            total_slot_count += slot_count;
+        }
+
+        {
+            let guard = self.temp_filling_group.lock();
+            let (unused_slot_count, slot_count) =
+                guard.count_unused_slot_count_and_all_slot_count();
+            trace!("ShardedAllocator filling shard unused {unused_slot_count} all {slot_count}");
+            total_unused_slot_count += unused_slot_count;
+            total_slot_count += slot_count;
+        }
+
+        if total_slot_count != 0 {
+            let fragment_rate = (total_unused_slot_count as f64) / (total_slot_count as f64);
+
+            trace!(
+                "ShardedAllocator fragment rate {:.1}%",
+                fragment_rate * 100.0
+            );
         }
     }
 }
@@ -303,7 +378,7 @@ impl<T> ShardedDataPtr<T> {
 
     /// Creating pointer is not unsafe. But using pointer is unsafe.
     pub(crate) fn ptr_at_shard(self, shard_index: ShardIndex) -> NonNull<T> {
-        let offset: usize = SLOT_COUNT_PER_SHARD * (shard_index.as_usize() + 1);
+        let offset: usize = SLOT_COUNT_PER_UNIT * (shard_index.as_usize() + 1);
 
         let u64_ptr: NonNull<u64> = self.base_ptr.cast::<u64>();
         // Safety: offset is within allocation

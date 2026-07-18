@@ -24,7 +24,7 @@
 //!
 //! When collector observes that ref counter sum is 0, it doesn't immediately free memory.
 //! It atomically clears each counter's tag (set last bit to 0).
-//! Then after some time it reads the counters again. If the referece count sum is still 0 and all tags are still 0, it means the counters haven't been decrementd (given counter sum is still 0, it also haven't incremented).
+//! Then after some time it reads the counters again. If the reference count sum is still 0 and all tags are still 0, it means the counters haven't been decremented (given counter sum is still 0, it also haven't incremented).
 //! Then it's safe to drop inner content.
 //!
 //! If the previously mentioned race condition happens,
@@ -34,7 +34,7 @@
 //! of Sdarc is live, which means counter sum is at least 1. Collector delaying observing the increment is fine,
 //! as long decrement is not visible before increment. Decrement uses Release which ensures that if the
 //! decrement is observed, the previous increments in same thread is also observable. For cross-thread case (increment
-//! in one thread, send to another thread to decrement), other synchronizations have established that incrementing counter inter-thread happens-before decrementing counter. (Even if increment is visible to collector before decrement, the collector's non-atomic way of reading conters can still cause race condition described above, which is solved by tagging.)
+//! in one thread, send to another thread to decrement), other synchronizations have established that incrementing counter inter-thread happens-before decrementing counter. (Even if increment is visible to collector before decrement, the collector's non-atomic way of reading counters can still cause race condition described above, which is solved by tagging.)
 //!
 //! The decrement and setting of bit use Release ordering. Collector reads counter using Acquire ordering.
 //! (Collector firstly do pre-scan using Relaxed ordering, which is an optimization that doesn't affect ordering.)

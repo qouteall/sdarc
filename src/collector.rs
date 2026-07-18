@@ -1,21 +1,17 @@
 use crate::reader_critical_section::READER_CRITICAL_SECTION;
 use crate::sdarc::{ClearWeakBackRefResult, SdarcInnerFatPtr};
-use crate::shard_index::{shard_indexes, ShardsArr};
+use crate::shard_index::{ShardsArr, shard_indexes};
 use crate::sharded_alloc::FULL_SHARD_ALLOC;
 use crossbeam::utils::CachePadded;
 use log::{debug, error};
 use parking_lot::Mutex;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use std::{mem, panic, thread};
-
-#[derive(Debug, Clone)]
-pub struct CollectorParams {
-    pub cycle_duration: Duration,
-}
+use std::{env, mem, panic, thread};
+use crate::env_params::CollectorParams;
 
 pub(crate) struct CollectorShared {
     params: CollectorParams,
@@ -82,28 +78,8 @@ pub(crate) fn on_new_sdarc_allocated(fat_ptr: SdarcInnerFatPtr) {
 
 static COLLECTOR: OnceLock<CollectorShared> = OnceLock::new();
 
-static DEFAULT_PARAM: CollectorParams = CollectorParams {
-    cycle_duration: Duration::from_millis(500),
-};
-
-/// Return false if the collector have already been initialized. The collector can only be initialized once.
-///
-/// Normal users don't need to call this. When the first `Sdarc` is being created, collector will be initialized,
-/// and collector thread will be spawned.
-///
-/// Only call it if you want to change collector param to be non-default value. And it should be called eariler
-/// than creating any Sdarc. Once it has been initialized, param cannot change.
-pub fn try_init_collector(params: CollectorParams) -> bool {
-    let mut is_new_init = false;
-    COLLECTOR.get_or_init(|| {
-        is_new_init = true;
-        CollectorShared::new(params)
-    });
-    is_new_init
-}
-
 fn get_collector() -> &'static CollectorShared {
-    COLLECTOR.get_or_init(|| CollectorShared::new(DEFAULT_PARAM.clone()))
+    COLLECTOR.get_or_init(|| CollectorShared::new(CollectorParams::new_from_env_var()))
 }
 
 /// Interrupt the collector thread from parking.
@@ -275,7 +251,11 @@ impl CollectorThreadState {
 
         self.update_tracked_counters_and_collect();
 
-        FULL_SHARD_ALLOC.do_maintenance();
+        FULL_SHARD_ALLOC.do_maintenance_by_collector();
+
+        if log::log_enabled!(log::Level::Trace) {
+            FULL_SHARD_ALLOC.log_status_in_trace_level();
+        }
     }
 
     fn update_tracked_counters_and_collect(&mut self) {
@@ -350,7 +330,7 @@ fn collector_thread_main() {
 
         debug!("Collection iteration {iteration_counter} took {elapsed_time:?}");
 
-        let to_wait = collector.params.cycle_duration.saturating_sub(elapsed_time);
+        let to_wait = collector.params.interval.saturating_sub(elapsed_time);
 
         debug!("Collector thread is going to wait {to_wait:?}");
 

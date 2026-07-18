@@ -1,3 +1,4 @@
+use crate::env_params::shard_count_from_env_var;
 use std::cell::Cell;
 use std::cmp::min;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -16,9 +17,13 @@ impl ShardCount {
 }
 
 static SHARD_COUNT: LazyLock<ShardCount> = LazyLock::new(init_shard_count);
-const MAX_SHARD_COUNT: usize = 256;
+pub(crate) const MAX_SHARD_COUNT: usize = 256;
 
 fn init_shard_count() -> ShardCount {
+    if let Some(c) = shard_count_from_env_var() {
+        return c;
+    }
+
     let available_parallelism: usize = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);

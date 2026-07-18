@@ -23,6 +23,7 @@ pub struct Sdarc<T> {
 
 impl<T: Send + Sync> Sdarc<T> {
     pub fn new(value: T) -> Sdarc<T> {
+        /// dropped in [`drop_sdarc_inner_impl`]
         let ptr: NonNull<SdarcInner<T>> = Box::leak(Box::new(SdarcInner::new(value))).into();
         on_new_sdarc_allocated(SdarcInnerFatPtr {
             ptr: SdarcInnerPtrErased::from_typed(ptr),
@@ -141,6 +142,21 @@ impl<T> Clone for Sdarc<T> {
 
 impl<T> Drop for Sdarc<T> {
     fn drop(&mut self) {
+        /// Why use Release ordering:
+        /// If the collector observes the decremented reference count (with tag set) using Acquire ordering,
+        /// it should synchronize-with the decrement,
+        /// which ensures that collector can see the counter increments before the decrement.
+        ///
+        /// What about incrementing a Sdarc reference count then send to another thread to decrement?
+        /// The sending data between threads will do synchronization that ensures increment happens-before decrement.
+        ///
+        /// What about current thread change shard index using [`shard_index::set_current_thread_shard_index`]?
+        /// The thread could increment one shard counter, change its shard index, then decrement another shard's
+        /// counter.
+        /// It's still fine, because in same thread the increment is sequenced-before decrement,
+        /// even if they touch different counter shards.
+        /// If the collector observes that the decremented counter shard is in decremented value,
+        /// the collector can observe the increment in another counter shard.
         self.inner_ref()
             .counters
             .at_curr_thread_shard()
@@ -264,7 +280,7 @@ impl<T> AtomicNullableSdarc<T> {
         // There is a chance thread A get stuck right after loading pointer but right before incrementing counter,
         // the thread B mutates atomic pointer and drop the original Sdarc, then inner data freed by background collector,
         // then thread A resumes and then use-after-free.
-        // The reader cirtical section avoids it. Background collector will only free if no thread is stuck in reader side critical section.
+        // The reader critical section avoids it. Background collector will only free if no thread is stuck in reader side critical section.
         READER_CRITICAL_SECTION.reader_critical_section(|| {
             /// Why use Acquire ordering: synchronizes-with atomic pointer mutator.
             /// Ensure that the atomic pointer mutator thread's changed before mutating
@@ -415,10 +431,14 @@ impl<T: Send + Sync> AtomicSdarc<T> {
 pub(crate) struct WeakSdarcInner<T> {
     /// There is a circular reference. `SdarcInner` has `Sdarc<WeakSdarcInner>`, this references back.
     /// When initialized, it's not null.
-    /// When the SdarcInner's strong counter sum reach zero and stay unchanged, this ptr will be set to null.
-    /// Upgrade can only succeed if it's not null, and upgrade is under reader side critical section.
+    /// When collector thinks that a `SdarcInner`'s strong count sum reach zero (observed zero sum once, clear tags, observed zero sum in next iteration with no tag set),
+    /// If [`SdarcInner::weak_inner_ref`] is initialized, this backref will be set to null.
+    /// Upgrade can only succeed if it's not null, and upgrade is under reader critical section.
     ///
-    /// Note: it's possible that a concurrent upgrade resurrects the Sdarc. After resurrection, `Sdarc` can still downgrade, but `WeakSdarc` won't ever be able to upgrade.
+    /// Note: it's possible that a concurrent upgrade resurrects the SdarcInner whose strong count sum is 0.
+    /// After resurrection, `Sdarc` can still downgrade.
+    /// The `WeakSdarc` may be unable to upgrade or may can upgrade after resurrection,
+    /// depending on whether backref is cleared, which depends on collector timing.
     back_ref: AtomicPtr<SdarcInner<T>>,
 }
 
@@ -442,7 +462,7 @@ impl<T> Drop for WeakSdarcInner<T> {
 /// Then the dead `Sdarc` will be resurrected.
 ///
 /// Why have the weird resurrection mechanism, instead of ensuring that resurrection is not possible:
-/// Avoiding resurrection requires [`WeakSdarc::upgrade`] to ensure whether strong count sum is 0 instantly.
+/// Avoiding resurrection requires [`WeakSdarc::upgrade`] to ensure whether strong count sum is 0 immediately.
 /// Without locking, it's not possible. We avoid locking of counters to improve scalability.
 pub struct WeakSdarc<T> {
     sdarc_weak_inner: Sdarc<WeakSdarcInner<T>>,
@@ -456,11 +476,12 @@ pub(crate) enum ClearWeakBackRefResult {
 
 /// When this function is called, the strong count sum reaches 0.
 /// But there may be weak references, and the weak references can still upgrade at the same time.
-/// But the [`SdarcInner::weak_sdarc_inner_ref`] will never be initialized if it was not initialized,
-/// because it can only be initialized from strong reference, and strong reference doesn't exist
-/// if no weak reference to it exits.
 ///
-/// If [`SdarcInner::weak_sdarc_inner_ref`] has been initialized, it will clear the backref.
+/// But the [`SdarcInner::weak_inner_ref`] will never be initialized at that time if it is not initialized,
+/// because it can only be initialized from strong reference, and strong reference doesn't exist
+/// if no weak reference to it exists.
+///
+/// If [`SdarcInner::weak_inner_ref`] has been initialized, it will clear the backref.
 /// After clearing, weak ref's upgrade will fail. And the backref will never become non-null again.
 ///
 /// If the `Sdarc` has never been downgraded, it will return [`ClearWeakBackRefResult::WeakRefNotInvolved`],
@@ -474,7 +495,8 @@ pub(crate) enum ClearWeakBackRefResult {
 /// In that case, the backref has already been cleared. No more upgrade is possible. The collector will free it
 /// once strong count sum reaches 0 and counters keep being same across one iteration.
 ///
-/// Note that if it dies then resurrects quickly, without the dead state being observed by collector, then this function won't be called at that time.
+/// Note that if it dies then resurrects quickly, without the "confirmed dead" state being observed by collector,
+/// then this function won't be called at that time.
 fn clear_weak_backref_impl<T>(ptr: SdarcInnerPtrErased) -> ClearWeakBackRefResult {
     let p: NonNull<SdarcInner<T>> = ptr.into_typed::<T>();
 
@@ -492,7 +514,7 @@ fn clear_weak_backref_impl<T>(ptr: SdarcInnerPtrErased) -> ClearWeakBackRefResul
             ClearWeakBackRefResult::WeakBackRefCleared
         }
     } else {
-        /// When this function is called, the strong count reaches 0.
+        /// When this function is called, the strong count sum reaches 0.
         /// It's only initialized in [`Sdarc::downgrade`] which requires a strong reference.
         /// So if it's not initialized now, it will never initialize, then there will be no weak ref to it,
         /// and no upgrade is possible.
@@ -516,14 +538,13 @@ impl<T: Send + Sync> Sdarc<T> {
 }
 
 impl<T: Send + Sync> WeakSdarc<T> {
+    /// Unlike std `Arc` and `Weak`, `Sdarc` and `WeakSdarc` have resurrection mechanism.
+    /// Even after strong count sum reaches zero, upgrade may still succeed, then it will be resurrected.
+    ///
+    /// If the strong count sum has reached 0, then it's not deterministic whether upgrade will succeed
+    /// (depending on collector timing). Upgrade may fail despite there exists strong references to same pointee.
+    ///
     /// If the strong count sum never reaches 0, upgrade will succeed.
-    ///
-    /// If the strong count has reached 0, then it's not deterministic whether upgrade will succeed.
-    ///
-    /// Unlike std `Arc`, `Sdarc` has resurrection mechanism.
-    /// Even after strong count sum reach zero, upgrade may still succeed, then it will be resurrected.
-    ///
-    /// Even if there is strong reference, if it has undergone resurrection, its weak ref may not be able to upgrade.
     pub fn upgrade(&self) -> Option<Sdarc<T>> {
         let weak_inner: &WeakSdarcInner<T> = self.sdarc_weak_inner.deref();
         // Similar to loading from atomic Sdarc, it may be stuck between loading pointer and incrementing counter,
