@@ -1,21 +1,20 @@
 use crate::env_params::CollectorParams;
 use crate::reader_critical_section::READER_CRITICAL_SECTION;
-use crate::sdarc::{
-    ClearWeakBackRefResult, Sdarc, SdarcInnerFatPtr, SdarcInnerPtrErased, SdarcVTable,
-};
+use crate::sdarc::{ClearWeakBackRefResult, SdarcInnerFatPtr};
 use crate::shard_index::{ShardsArr, shard_indexes};
-use crate::sharded_alloc::FULL_SHARD_ALLOC;
+use crate::sharded_alloc::{FULL_SHARD_ALLOC, ShardedDataPtr};
+use crate::tagged_counter::AtomicTaggedCounter;
 use crossbeam::utils::CachePadded;
 use log::{debug, error};
 use parking_lot::Mutex;
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::{Deref, DerefMut, Not};
-use std::sync::{atomic, OnceLock};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, atomic};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-use std::{env, mem, panic, thread};
+use std::time::Instant;
+use std::{mem, panic, thread};
 
 pub(crate) struct CollectorShared {
     params: CollectorParams,
@@ -31,7 +30,7 @@ pub(crate) struct CollectorShared {
 }
 
 pub(crate) struct CollectorPendingDataShard {
-    new_counters_to_track: Vec<SdarcInnerFatPtr>,
+    new_counters_to_track: Vec<(SdarcInnerFatPtr, ShardedDataPtr<AtomicTaggedCounter>)>,
 }
 
 impl CollectorPendingDataShard {
@@ -67,17 +66,24 @@ impl CollectorShared {
         }
     }
 
-    fn on_new_sdarc_allocated(&self, fat_ptr: SdarcInnerFatPtr) {
+    fn on_new_sdarc_allocated(
+        &self,
+        fat_ptr: SdarcInnerFatPtr,
+        counters_ptr: ShardedDataPtr<AtomicTaggedCounter>,
+    ) {
         self.pending_to_track
             .at_curr_thread_shard()
             .lock()
             .new_counters_to_track
-            .push(fat_ptr);
+            .push((fat_ptr, counters_ptr));
     }
 }
 
-pub(crate) fn on_new_sdarc_allocated(fat_ptr: SdarcInnerFatPtr) {
-    get_collector().on_new_sdarc_allocated(fat_ptr);
+pub(crate) fn on_new_sdarc_allocated(
+    fat_ptr: SdarcInnerFatPtr,
+    counters_ptr: ShardedDataPtr<AtomicTaggedCounter>,
+) {
+    get_collector().on_new_sdarc_allocated(fat_ptr, counters_ptr);
 }
 
 static COLLECTOR: OnceLock<CollectorShared> = OnceLock::new();
@@ -99,12 +105,15 @@ pub fn collector_update_now() {
 struct CollectorThreadState {
     collector: &'static CollectorShared,
 
-    /// Use BTreeMap rather than HashMap because BTreeMap sorts by pointer, so cache locality when scanning is better
-    tracked_counters: BTreeMap<SdarcInnerPtrErased, TrackedCounter>,
+    /// Use BTreeMap and the key is pointer to counters, not pointer to SdarcInner:
+    /// The main thing that collector does is to read the counters.
+    /// By using counter ptr as key, and using sorted BTreeMap,
+    /// the cache locality of reading counters improves.
+    tracked_counters: BTreeMap<ShardedDataPtr<AtomicTaggedCounter>, TrackedCounter>,
 }
 
 struct TrackedCounter {
-    vtable_ref: &'static SdarcVTable,
+    fat_ptr: SdarcInnerFatPtr,
     state: TrackedCounterState,
 }
 
@@ -117,16 +126,13 @@ pub(crate) enum TrackedCounterState {
 impl TrackedCounter {
     fn new(fat_ptr: SdarcInnerFatPtr) -> Self {
         Self {
-            vtable_ref: fat_ptr.vtable_ref,
+            fat_ptr,
             state: TrackedCounterState::DefaultState,
         }
     }
 
-    fn update_state(&mut self, ptr: SdarcInnerPtrErased) {
-        let fat_ptr = SdarcInnerFatPtr {
-            vtable_ref: self.vtable_ref,
-            ptr,
-        };
+    fn update_state(&mut self) {
+        let fat_ptr = self.fat_ptr;
 
         match self.state {
             TrackedCounterState::DefaultState => {
@@ -284,28 +290,29 @@ impl CollectorThreadState {
                 return;
             }
 
-            to_re_check = self.update_specific_counters_and_collect_and_get_ptrs_to_re_check(to_re_check);
+            to_re_check =
+                self.update_specific_counters_and_collect_and_get_ptrs_to_re_check(to_re_check);
         }
     }
 
     fn update_all_tracked_counters_and_collect_and_get_ptrs_to_re_check(
         &mut self,
-    ) -> BTreeSet<SdarcInnerPtrErased> {
+    ) -> BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> {
         // This is important
         READER_CRITICAL_SECTION.spin_until_observing_non_critical_section_once_in_each_shard();
 
-        let mut to_free: Vec<SdarcInnerPtrErased> = Vec::new();
-        let mut new_to_re_check: BTreeSet<SdarcInnerPtrErased> = BTreeSet::new();
+        let mut to_free: Vec<ShardedDataPtr<AtomicTaggedCounter>> = Vec::new();
+        let mut new_to_re_check: BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> = BTreeSet::new();
 
-        for (ptr, tracked_counter) in &mut self.tracked_counters {
-            tracked_counter.update_state(*ptr);
+        for (counters_ptr, tracked_counter) in &mut self.tracked_counters {
+            tracked_counter.update_state();
             match &tracked_counter.state {
                 TrackedCounterState::DefaultState => {}
                 TrackedCounterState::RequiresReChecking => {
-                    new_to_re_check.insert(*ptr);
+                    new_to_re_check.insert(*counters_ptr);
                 }
                 TrackedCounterState::ReadyToFree => {
-                    to_free.push(*ptr);
+                    to_free.push(*counters_ptr);
                 }
             }
         }
@@ -321,28 +328,28 @@ impl CollectorThreadState {
 
     fn update_specific_counters_and_collect_and_get_ptrs_to_re_check(
         &mut self,
-        old_to_recheck: BTreeSet<SdarcInnerPtrErased>
-    ) -> BTreeSet<SdarcInnerPtrErased> {
+        old_to_recheck: BTreeSet<ShardedDataPtr<AtomicTaggedCounter>>,
+    ) -> BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> {
         // This is important
         READER_CRITICAL_SECTION.spin_until_observing_non_critical_section_once_in_each_shard();
 
-        let mut to_free: Vec<SdarcInnerPtrErased> = Vec::new();
-        let mut new_to_recheck: BTreeSet<SdarcInnerPtrErased> = BTreeSet::new();
+        let mut to_free: Vec<ShardedDataPtr<AtomicTaggedCounter>> = Vec::new();
+        let mut new_to_recheck: BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> = BTreeSet::new();
 
-        for ptr in old_to_recheck {
-            match self.tracked_counters.get_mut(&ptr) {
+        for counters_ptr in old_to_recheck {
+            match self.tracked_counters.get_mut(&counters_ptr) {
                 None => {
-                    panic!("Cannot find tracked counter {ptr:?}")
+                    panic!("Cannot find tracked counter {counters_ptr:?}")
                 }
                 Some(tracked_counter) => {
-                    tracked_counter.update_state(ptr);
+                    tracked_counter.update_state();
                     match &tracked_counter.state {
                         TrackedCounterState::DefaultState => {}
                         TrackedCounterState::RequiresReChecking => {
-                            new_to_recheck.insert(ptr);
+                            new_to_recheck.insert(counters_ptr);
                         }
                         TrackedCounterState::ReadyToFree => {
-                            to_free.push(ptr);
+                            to_free.push(counters_ptr);
                         }
                     }
                 }
@@ -356,19 +363,15 @@ impl CollectorThreadState {
         new_to_recheck
     }
 
-    fn free_pointers(&mut self, to_free: &mut Vec<SdarcInnerPtrErased>) {
-        for ptr in to_free {
-            let tracked_counter = self.tracked_counters.remove(&ptr).unwrap();
+    fn free_pointers(&mut self, to_free: &mut Vec<ShardedDataPtr<AtomicTaggedCounter>>) {
+        for counters_ptr in to_free {
+            let tracked_counter = self.tracked_counters.remove(&counters_ptr).unwrap();
             assert!(matches!(
                 tracked_counter.state,
                 TrackedCounterState::ReadyToFree
             ));
 
-            let fat_ptr = SdarcInnerFatPtr {
-                ptr: *ptr,
-                vtable_ref: tracked_counter.vtable_ref,
-            };
-
+            let fat_ptr = tracked_counter.fat_ptr;
             let res = panic::catch_unwind(move || {
                 fat_ptr.free();
             });
@@ -389,10 +392,10 @@ impl CollectorThreadState {
                 mem::replace(guard.deref_mut(), CollectorPendingDataShard::new())
             };
 
-            for fat_ptr in taken.new_counters_to_track {
+            for (fat_ptr, counters_ptr) in taken.new_counters_to_track {
                 let replaced = self
                     .tracked_counters
-                    .insert(fat_ptr.ptr, TrackedCounter::new(fat_ptr));
+                    .insert(counters_ptr, TrackedCounter::new(fat_ptr));
                 assert!(replaced.is_none());
             }
         }
@@ -453,7 +456,7 @@ struct CollectorThreadLocal {
     /// In [`Sdarc::drop`] it uses thread local to see whether it's the collector thread. If is, then
     /// the ptr is added to this set. The collector then re-check this set and do immediate updates without waiting.
     /// In the between the collector goes through reader critical section to ensure safety.
-    counters_to_recheck: RefCell<BTreeSet<SdarcInnerPtrErased>>,
+    counters_to_recheck: RefCell<BTreeSet<ShardedDataPtr<AtomicTaggedCounter>>>,
 }
 
 /// It's only initialized in collector thread. Initialized in [`collector_thread_main`]
@@ -468,22 +471,24 @@ impl CollectorThreadLocal {
         }
     }
 
-    fn add_pending_to_check(&self, ptr: SdarcInnerPtrErased) {
+    fn add_pending_to_check(&self, ptr: ShardedDataPtr<AtomicTaggedCounter>) {
         self.counters_to_recheck.borrow_mut().insert(ptr);
     }
 
-    fn take_to_recheck(&self) -> BTreeSet<SdarcInnerPtrErased> {
+    fn take_to_recheck(&self) -> BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> {
         mem::take(self.counters_to_recheck.borrow_mut().deref_mut())
     }
 }
 
-pub(crate) fn on_sdarc_drop(ptr: SdarcInnerPtrErased) {
+pub(crate) fn on_sdarc_drop(counters_ptr: ShardedDataPtr<AtomicTaggedCounter>) {
     COLLECTOR_THREAD_LOCAL.with(|cell| {
         match cell.get() {
             None => {
                 // This is not collector thread
             }
-            Some(_) => {}
+            Some(collector_thread_local) => {
+                collector_thread_local.add_pending_to_check(counters_ptr)
+            }
         }
     })
 }

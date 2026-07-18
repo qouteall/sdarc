@@ -10,9 +10,10 @@ use log::trace;
 use parking_lot::{Mutex, RwLock};
 use scopeguard::guard_on_unwind;
 use std::alloc::{Layout, alloc, dealloc};
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem;
-use std::ops::{Deref, DerefMut, Index, IndexMut, Not};
+use std::ops::{DerefMut, Index, IndexMut, Not};
 use std::ptr::{NonNull, drop_in_place};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -374,6 +375,7 @@ pub(crate) fn total_sharded_alloc_used_slots() -> usize {
 /// It represents pointer to a piece of data in same offset in every shard.
 ///
 /// The data's size should be same as `u64`.
+#[derive(Debug)]
 pub(crate) struct ShardedDataPtr<T> {
     base_ptr: NonNull<u8>,
     _phantom: PhantomData<*mut T>,
@@ -387,6 +389,32 @@ impl<T> Copy for ShardedDataPtr<T> {}
 impl<T> Clone for ShardedDataPtr<T> {
     fn clone(&self) -> Self {
         *self
+    }
+}
+
+impl<T> PartialEq<Self> for ShardedDataPtr<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.base_ptr == other.base_ptr
+    }
+}
+
+impl<T> Eq for ShardedDataPtr<T> {}
+
+impl<T> PartialOrd for ShardedDataPtr<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T> Ord for ShardedDataPtr<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.base_ptr.cmp(&other.base_ptr)
+    }
+}
+
+impl<T> Hash for ShardedDataPtr<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.base_ptr.hash(state);
     }
 }
 
@@ -443,7 +471,7 @@ impl<T> ShardedDataPtr<T> {
 /// The size of T is at most 8 bytes, due to how the allocator work.
 ///
 /// The data of different shards will be in different cache lines.
-pub struct ShardedBox<T>(ShardedDataPtr<T>);
+pub struct ShardedBox<T>(pub(crate) ShardedDataPtr<T>);
 
 impl<T: Send + Sync> ShardedBox<T> {
     pub fn allocate_data_in_each_shard(init_func: impl Fn(ShardIndex) -> T) -> ShardedBox<T> {

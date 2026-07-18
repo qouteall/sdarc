@@ -75,6 +75,7 @@ impl TaggedCounter {
 }
 
 #[repr(transparent)]
+#[derive(Debug)]
 pub(crate) struct AtomicTaggedCounter(pub(crate) AtomicI64);
 
 impl AtomicTaggedCounter {

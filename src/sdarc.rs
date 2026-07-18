@@ -1,3 +1,4 @@
+use crate::collector;
 use crate::collector::on_new_sdarc_allocated;
 use crate::reader_critical_section::READER_CRITICAL_SECTION;
 use crate::sharded_alloc::ShardedBox;
@@ -10,7 +11,6 @@ use std::ops::Deref;
 use std::ptr::{NonNull, null_mut};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use crate::collector;
 
 /// Sharded deferred atomic reference counting.
 ///
@@ -18,7 +18,7 @@ use crate::collector;
 /// So it will have much fewer cache contention than std `Arc`.
 ///
 /// When the counter sum goes 0, it's not immediately freed. It's freed by the background collector deferred.
-/// 
+///
 /// It doesn't support variable-sized type due to internal implementation.
 pub struct Sdarc<T> {
     inner_ptr: NonNull<SdarcInner<T>>,
@@ -28,10 +28,14 @@ impl<T: Send + Sync> Sdarc<T> {
     pub fn new(value: T) -> Sdarc<T> {
         /// dropped in [`drop_sdarc_inner_impl`]
         let ptr: NonNull<SdarcInner<T>> = Box::leak(Box::new(SdarcInner::new(value))).into();
-        on_new_sdarc_allocated(SdarcInnerFatPtr {
-            ptr: SdarcInnerPtrErased::from_typed(ptr),
-            vtable_ref: get_sdarc_vtable_ref::<T>(),
-        });
+
+        on_new_sdarc_allocated(
+            SdarcInnerFatPtr {
+                ptr: SdarcInnerPtrErased::from_typed(ptr),
+                vtable_ref: get_sdarc_vtable_ref::<T>(),
+            },
+            unsafe { ptr.as_ref() }.counters.0,
+        );
         Sdarc { inner_ptr: ptr }
     }
 }
@@ -166,12 +170,12 @@ impl<T> Drop for Sdarc<T> {
             .decrement_ref_count_and_set_tag_release();
 
         /// If it's dropped in collector thread, will notify collector to re-check it.
-        collector::on_sdarc_drop(SdarcInnerPtrErased::from_typed(self.inner_ptr));
+        collector::on_sdarc_drop(self.inner_ref().counters.0);
     }
 }
 
 /// It's type-erased thin ptr.
-/// 
+///
 /// It's thin ptr so it's not trivial to make Sdarc support variable-sized type.
 /// It's possible to support that, TODO.
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
