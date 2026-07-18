@@ -10,6 +10,7 @@ use std::ops::Deref;
 use std::ptr::{NonNull, null_mut};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use crate::collector;
 
 /// Sharded deferred atomic reference counting.
 ///
@@ -17,6 +18,8 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 /// So it will have much fewer cache contention than std `Arc`.
 ///
 /// When the counter sum goes 0, it's not immediately freed. It's freed by the background collector deferred.
+/// 
+/// It doesn't support variable-sized type due to internal implementation.
 pub struct Sdarc<T> {
     inner_ptr: NonNull<SdarcInner<T>>,
 }
@@ -161,11 +164,17 @@ impl<T> Drop for Sdarc<T> {
             .counters
             .at_curr_thread_shard()
             .decrement_ref_count_and_set_tag_release();
+
+        /// If it's dropped in collector thread, will notify collector to re-check it.
+        collector::on_sdarc_drop(SdarcInnerPtrErased::from_typed(self.inner_ptr));
     }
 }
 
-// Erase type in vtable function signature
-#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+/// It's type-erased thin ptr.
+/// 
+/// It's thin ptr so it's not trivial to make Sdarc support variable-sized type.
+/// It's possible to support that, TODO.
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct SdarcInnerPtrErased(pub NonNull<u8>);
 
 unsafe impl Send for SdarcInnerPtrErased {}
