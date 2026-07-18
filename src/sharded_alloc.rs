@@ -233,8 +233,7 @@ impl AllocUnitGroup {
         }
     }
 
-    // Only used in trace logging
-    fn count_unused_slot_count_and_all_slot_count(&self) -> (usize, usize) {
+    pub(crate) fn count_unused_slot_count_and_all_slot_count(&self) -> (usize, usize) {
         let unused_slot_count: usize = self
             .all_units
             .iter()
@@ -345,6 +344,32 @@ impl FullShardAlloc {
 
 pub(crate) static FULL_SHARD_ALLOC: LazyLock<FullShardAlloc> =
     LazyLock::new(|| FullShardAlloc::initialize());
+
+/// Returns the total number of sharded-alloc slots currently marked as used.
+/// For leak-checking in tests: when everything is dropped except the
+/// reader-critical-section counter, the count should be exactly 1.
+pub(crate) fn total_sharded_alloc_used_slots() -> usize {
+    let alloc = &FULL_SHARD_ALLOC;
+    let mut total_unused: usize = 0;
+    let mut total_slots: usize = 0;
+
+    for shard_index in shard_indexes() {
+        let shard = &alloc.shards_to_allocate[shard_index];
+        let guard = shard.read();
+        let (unused, slots) = guard.count_unused_slot_count_and_all_slot_count();
+        total_unused += unused;
+        total_slots += slots;
+    }
+
+    {
+        let guard = alloc.temp_filling_group.lock();
+        let (unused, slots) = guard.count_unused_slot_count_and_all_slot_count();
+        total_unused += unused;
+        total_slots += slots;
+    }
+
+    total_slots.saturating_sub(total_unused)
+}
 
 /// It represents pointer to a piece of data in same offset in every shard.
 ///

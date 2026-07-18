@@ -8,3 +8,6 @@ pub mod collector;
 pub mod sdarc;
 pub mod tagged_counter;
 pub mod env_params;
+
+#[cfg(test)]
+mod tests;
