@@ -1,17 +1,18 @@
 use crate::env_params::CollectorParams;
-use crate::reader_critical_section::READER_CRITICAL_SECTION;
-use crate::sdarc::{ClearWeakBackRefResult, SdarcInnerFatPtr};
+use crate::atomic_sdarc::{HazardPointerSet, traverse_atomic_reader_signals};
+use crate::sdarc::SdarcInnerFatPtr;
 use crate::shard_index::{ShardsArr, shard_indexes};
 use crate::sharded_alloc::{FULL_SHARD_ALLOC, ShardedDataPtr};
 use crate::tagged_counter::AtomicTaggedCounter;
+use crate::weak_sdarc::ClearWeakBackRefResult;
 use crossbeam::utils::CachePadded;
 use log::{debug, error, warn};
 use parking_lot::{Condvar, Mutex};
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 use std::{mem, panic, thread};
@@ -57,7 +58,7 @@ impl CollectorState {
     }
 
     /// The [`collector_update_now_and_wait`] needs to wait until one full collection.
-    /// For example, if it's currently working on iteration 3, it has to wait until iteration 4 finishes. 
+    /// For example, if it's currently working on iteration 3, it has to wait until iteration 4 finishes.
     /// If it just waits until iteration 3 finishes, the `Sdarc` whose ref count sum becomes 0 during iteration 3 may be not collected.
     fn after_at_least_one_full_collection(self) -> CollectorState {
         match self {
@@ -419,13 +420,16 @@ impl CollectorThreadState {
     fn update_all_tracked_counters_and_collect_and_get_ptrs_to_re_check(
         &mut self,
     ) -> BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> {
-        // This is important
-        READER_CRITICAL_SECTION.spin_until_observing_non_critical_section_once_in_each_shard();
+        let hazard_pointer_set = traverse_atomic_reader_signals();
 
         let mut to_free: Vec<ShardedDataPtr<AtomicTaggedCounter>> = Vec::new();
         let mut new_to_re_check: BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> = BTreeSet::new();
 
         for (counters_ptr, tracked_counter) in &mut self.tracked_counters {
+            if hazard_pointer_set.contains(tracked_counter.fat_ptr.ptr) {
+                continue;
+            }
+
             tracked_counter.update_state(*counters_ptr);
             match &tracked_counter.state {
                 TrackedCounterState::DefaultState => {}
@@ -451,8 +455,7 @@ impl CollectorThreadState {
         &mut self,
         old_to_recheck: BTreeSet<ShardedDataPtr<AtomicTaggedCounter>>,
     ) -> BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> {
-        // This is important
-        READER_CRITICAL_SECTION.spin_until_observing_non_critical_section_once_in_each_shard();
+        let hazard_pointer_set = traverse_atomic_reader_signals();
 
         let mut to_free: Vec<ShardedDataPtr<AtomicTaggedCounter>> = Vec::new();
         let mut new_to_recheck: BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> = BTreeSet::new();
@@ -467,6 +470,10 @@ impl CollectorThreadState {
                     continue;
                 }
                 Some(tracked_counter) => {
+                    if hazard_pointer_set.contains(tracked_counter.fat_ptr.ptr) {
+                        continue;
+                    }
+
                     tracked_counter.update_state(counters_ptr);
                     match &tracked_counter.state {
                         TrackedCounterState::DefaultState => {}

@@ -3,7 +3,6 @@
 pub mod shard_index;
 pub mod sharded_alloc;
 pub mod sharded_rwlock;
-pub mod reader_critical_section;
 pub mod collector;
 pub mod sdarc;
 pub mod tagged_counter;
@@ -11,3 +10,5 @@ pub mod env_params;
 
 #[cfg(test)]
 mod tests;
+pub mod atomic_sdarc;
+pub mod weak_sdarc;

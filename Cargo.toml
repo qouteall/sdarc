@@ -6,16 +6,32 @@ description = "Sharded Deferred Atomic Reference Counting"
 
 [dependencies]
 crossbeam = "0.8"
-parking_lot = "0.12"
+
+# use on-github version to make it runnable in miri
+# parking_lot currently has no release since fixing https://github.com/Amanieu/parking_lot/issues/477
+parking_lot = { git = "https://github.com/Amanieu/parking_lot", branch = "master" }
+
 scopeguard = "1.2"
 log = "0.4"
+append-only-vec = "0.1"
+rustc-hash = "2.1"
+
+membarrier2 = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-rusty-fork = "0.3"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
+arc-swap = "1"
+serial_test = "3"
 
 [[bench]]
 name = "collector_bench"
 harness = false
+
+[[bench]]
+name = "comparison_bench"
+harness = false
+
+[profile.release]
+debug = true

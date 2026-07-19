@@ -88,6 +88,10 @@ impl AtomicTaggedCounter {
     pub fn increment_ref_count_relaxed(&self) {
         self.0.fetch_add(2, Ordering::Relaxed);
     }
+    
+    pub fn increment_ref_count_seqcst(&self) {
+        self.0.fetch_add(2, Ordering::SeqCst);
+    }
 
     const MASK_FOR_CLEARING_TAG: i64 = !1;
 

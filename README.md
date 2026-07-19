@@ -27,3 +27,5 @@ This library doesn't suit these use ases:
 - This library doesn't support no_std.
 
 Compare it with Linux percpu-refcount TODO
+
+TODO some init functions can be const

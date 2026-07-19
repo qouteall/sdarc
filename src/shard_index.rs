@@ -45,7 +45,7 @@ fn init_shard_count() -> ShardCount {
 }
 
 /// The shard count won't change after initialization
-pub(crate) fn get_shard_count() -> ShardCount {
+pub fn get_shard_count() -> ShardCount {
     *SHARD_COUNT
 }
 

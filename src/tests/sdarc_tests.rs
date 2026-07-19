@@ -2,6 +2,7 @@ use crate::sdarc::Sdarc;
 use crate::collector::collector_update_now;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
+use crate::weak_sdarc::WeakSdarc;
 
 #[test]
 fn test_new_and_deref() {
@@ -62,9 +63,9 @@ fn test_is_same_pointee() {
     let b = a.clone();
     let c = Sdarc::new(10i32);
 
-    assert!(Sdarc::is_same_pointee(&a, &b));
-    assert!(!Sdarc::is_same_pointee(&a, &c));
-    assert!(!Sdarc::is_same_pointee(&b, &c));
+    assert!(Sdarc::<i32>::ptr_eq(&a, &b));
+    assert!(!Sdarc::<i32>::ptr_eq(&a, &c));
+    assert!(!Sdarc::<i32>::ptr_eq(&b, &c));
 }
 
 #[test]
@@ -137,13 +138,13 @@ fn test_sdarc_is_sync() {
 #[test]
 fn test_weak_sdarc_is_send() {
     fn assert_send<T: Send>() {}
-    assert_send::<crate::sdarc::WeakSdarc<i32>>();
+    assert_send::<WeakSdarc<i32>>();
 }
 
 #[test]
 fn test_weak_sdarc_is_sync() {
     fn assert_sync<T: Sync>() {}
-    assert_sync::<crate::sdarc::WeakSdarc<i32>>();
+    assert_sync::<WeakSdarc<i32>>();
 }
 
 #[test]

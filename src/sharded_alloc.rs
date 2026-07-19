@@ -7,7 +7,7 @@ use crate::shard_index::{
 };
 use crossbeam::utils::CachePadded;
 use log::trace;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex};
 use scopeguard::guard_on_unwind;
 use std::alloc::{Layout, alloc, dealloc};
 use std::hash::{Hash, Hasher};
@@ -17,6 +17,7 @@ use std::ops::{DerefMut, Index, IndexMut, Not, Sub};
 use std::ptr::{NonNull, drop_in_place};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::env_params::disable_sharded_alloc_maintenance;
 
 /// Each slot is 8 bytes (same size as `u64`).
 /// In mainstream platforms (X86-64 and ARM64), CachePadded use 128 alignment, which is 16 `u64`s.
@@ -56,7 +57,7 @@ impl AllocUnit {
         let len_bytes = Self::data_len_in_bytes();
 
         let layout = Layout::from_size_align(
-            len_bytes, 8, // align is same as u64
+            len_bytes, 8 * 16, // the alignment should match cache line in main platforms
         )
         .unwrap();
         layout
@@ -280,6 +281,10 @@ impl FullShardAlloc {
     }
 
     pub(crate) fn do_maintenance_by_collector(&self) {
+        if disable_sharded_alloc_maintenance() {
+            return;
+        }
+
         let mut filling_group_guard = self.temp_filling_group.lock();
 
         for shard_index in shard_indexes() {
@@ -312,34 +317,37 @@ impl FullShardAlloc {
     fn get_status_report(&self) -> ShardedAllocStatusReport {
         // Collector can run in parallel and swap shards thus make number inaccurate. Lock all locks to prevent.
         let temp_guard = self.temp_filling_group.lock();
-        let shard_guards: Vec<_> = shard_indexes()
-            .map(|i| self.groups[i].lock())
-            .collect();
+        let shard_guards: Vec<_> = shard_indexes().map(|i| self.groups[i].lock()).collect();
 
-        let mut per_shard: Vec<(usize, usize)> = Vec::with_capacity(get_shard_count().as_usize());
+        let mut per_shard: Vec<PerGroupStatusReport> =
+            Vec::with_capacity(get_shard_count().as_usize());
         let mut total_unused: usize = 0;
         let mut total_slots: usize = 0;
 
         for guard in &shard_guards {
-            let (unused, slots) = guard.count_unused_slot_count_and_all_slot_count();
-            per_shard.push((unused, slots));
-            total_unused += unused;
-            total_slots += slots;
+            let (unused_slot_count, all_slot_count) =
+                guard.count_unused_slot_count_and_all_slot_count();
+            per_shard.push(PerGroupStatusReport {
+                unused_slot_count,
+                all_slot_count,
+            });
+            total_unused += unused_slot_count;
+            total_slots += all_slot_count;
         }
 
-        let (filling_unused, filling_slots) =
+        let (filling_group_unused_slot_count, filling_group_all_slot_count) =
             temp_guard.count_unused_slot_count_and_all_slot_count();
 
-        total_unused += filling_unused;
-        total_slots += filling_slots;
-
-        drop(shard_guards);
-        drop(temp_guard);
+        total_unused += filling_group_unused_slot_count;
+        total_slots += filling_group_all_slot_count;
 
         ShardedAllocStatusReport {
             per_shard,
-            filling_group: (filling_unused, filling_slots),
-            total_used: total_slots.sub(total_unused),
+            filling_group: PerGroupStatusReport {
+                unused_slot_count: filling_group_all_slot_count,
+                all_slot_count: filling_group_all_slot_count,
+            },
+            total_used_slot_count: total_slots.sub(total_unused),
             fragment_rate: if total_slots != 0 {
                 total_unused as f64 / total_slots as f64
             } else {
@@ -350,30 +358,23 @@ impl FullShardAlloc {
 
     pub(crate) fn log_status_in_trace_level(&self) {
         let report = self.get_status_report();
-        for (i, &(unused, slots)) in report.per_shard.iter().enumerate() {
-            trace!("ShardedAllocator shard {i} unused {unused} all {slots}");
-        }
-        trace!(
-            "ShardedAllocator filling shard unused {} all {}",
-            report.filling_group.0,
-            report.filling_group.1,
-        );
-        trace!(
-            "ShardedAllocator fragment rate {:.1}%",
-            report.fragment_rate * 100.0,
-        );
+        trace!("Sharded allocator status {report:?}");
     }
 }
 
-struct ShardedAllocStatusReport {
-    /// (unused, total) per shard, indexed by shard number
-    per_shard: Vec<(usize, usize)>,
-    /// (unused, total) for the temp filling group
-    filling_group: (usize, usize),
-    /// computed: total_slots - total_unused
-    #[allow(dead_code)]
-    total_used: usize,
-    /// computed: total_unused / total_slots (0.0 if no slots)
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct PerGroupStatusReport {
+    unused_slot_count: usize,
+    all_slot_count: usize,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct ShardedAllocStatusReport {
+    per_shard: Vec<PerGroupStatusReport>,
+    filling_group: PerGroupStatusReport,
+    total_used_slot_count: usize,
     fragment_rate: f64,
 }
 
@@ -385,7 +386,7 @@ pub(crate) static FULL_SHARD_ALLOC: LazyLock<FullShardAlloc> =
 /// reader-critical-section counter, the count should be exactly 1.
 #[cfg(test)]
 pub(crate) fn total_sharded_alloc_used_slots() -> usize {
-    FULL_SHARD_ALLOC.get_status_report().total_used
+    FULL_SHARD_ALLOC.get_status_report().total_used_slot_count
 }
 
 /// It represents pointer to a piece of data in same offset in every shard.

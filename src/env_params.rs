@@ -11,7 +11,7 @@ pub(crate) struct CollectorParams {
 }
 
 impl CollectorParams {
-    const DEFAULT_COLLECTOR_INTERVAL: Duration = Duration::from_millis(200);
+    const DEFAULT_COLLECTOR_INTERVAL: Duration = Duration::from_millis(500);
 
     pub fn new_from_env_var() -> Self {
         let interval: Duration = if let Ok(s) = env::var(ENV_COLLECTOR_INTERVAL_MS) {
@@ -52,4 +52,15 @@ pub(crate) fn shard_count_from_env_var() -> Option<ShardCount> {
     } else {
         None
     }
+}
+
+/// We want collector to run frequently to increase chance of discovering race conditions.
+/// But collector does sharded alloc maintenance which takes time and make collector slow.
+/// So allow disabling it.
+pub(crate) fn disable_sharded_alloc_maintenance() -> bool {
+    #[cfg(not(test))]
+    return false;
+
+    #[cfg(test)]
+    env::var("RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE").is_ok()
 }

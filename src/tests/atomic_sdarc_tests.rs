@@ -1,5 +1,6 @@
-use crate::sdarc::{AtomicNullableSdarc, AtomicSdarc, Sdarc};
+use crate::atomic_sdarc::{AtomicNullableSdarc, AtomicSdarc};
 use crate::collector::collector_update_now;
+use crate::sdarc::Sdarc;
 
 // ============================================================================
 // AtomicNullableSdarc tests
