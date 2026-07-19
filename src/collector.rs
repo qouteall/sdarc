@@ -184,7 +184,7 @@ pub fn collector_update_now_and_wait() {
 
     collector
         .status_condvar
-        .wait_while(&mut guard, |curr_state| *curr_state >= state_to_wait_until);
+        .wait_while(&mut guard, |curr_state| *curr_state < state_to_wait_until);
 }
 
 struct CollectorThreadState {
