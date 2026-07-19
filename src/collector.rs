@@ -5,7 +5,7 @@ use crate::shard_index::{ShardsArr, shard_indexes};
 use crate::sharded_alloc::{FULL_SHARD_ALLOC, ShardedDataPtr};
 use crate::tagged_counter::AtomicTaggedCounter;
 use crossbeam::utils::CachePadded;
-use log::{debug, error};
+use log::{debug, error, warn};
 use parking_lot::Mutex;
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,7 +26,11 @@ pub(crate) struct CollectorShared {
     /// but Vec is larger than that.
     pending_to_track: ShardsArr<CachePadded<Mutex<CollectorPendingDataShard>>>,
 
-    collection_iteration_counter: AtomicU64,
+    /// The outer iteration runs in interval specified by [`CollectorParams::interval`]
+    /// Within each outer iteration, there are inner iterations.
+    /// These counters are just for logging, so use Relaxed ordering.
+    outer_iteration_counter: AtomicU64,
+    inner_iteration_counter: AtomicU64,
 }
 
 pub(crate) struct CollectorPendingDataShard {
@@ -62,7 +66,8 @@ impl CollectorShared {
             pending_to_track: ShardsArr::new(|_| {
                 CachePadded::new(Mutex::new(CollectorPendingDataShard::new()))
             }),
-            collection_iteration_counter: AtomicU64::new(0),
+            outer_iteration_counter: AtomicU64::new(0),
+            inner_iteration_counter: AtomicU64::new(0),
         }
     }
 
@@ -131,14 +136,14 @@ impl TrackedCounter {
         }
     }
 
-    fn update_state(&mut self) {
+    fn update_state(&mut self, counters: ShardedDataPtr<AtomicTaggedCounter>) {
         let fat_ptr = self.fat_ptr;
 
         match self.state {
             TrackedCounterState::DefaultState => {
-                let relaxed_sum = read_ref_count_sum_relaxed(fat_ptr);
+                let relaxed_sum = read_ref_count_sum_relaxed(counters);
                 if relaxed_sum == 0 {
-                    let sum = clear_tags_and_read_ref_count_sum_relaxed(fat_ptr);
+                    let sum = clear_tags_and_read_ref_count_sum_relaxed(counters);
                     if sum == 0 {
                         // counters tagged and observed sum is zero, going to re-check
                         self.state = TrackedCounterState::RequiresReChecking;
@@ -156,7 +161,7 @@ impl TrackedCounter {
                 }
             }
             TrackedCounterState::RequiresReChecking => {
-                let opt_sum = read_ref_count_sum_if_all_tags_unset_acquire(fat_ptr);
+                let opt_sum = read_ref_count_sum_if_all_tags_unset_acquire(counters);
                 match opt_sum {
                     None => {
                         // Observed that some tag is set. There is counter decrement in between.
@@ -208,29 +213,29 @@ impl TrackedCounter {
 /// Only when its result is 0 does counter sum be re-read using Acquire ordering.
 ///
 /// In most cases, collector will see non-zero sum so this can improve collector performance.
-fn read_ref_count_sum_relaxed(fat_ptr: SdarcInnerFatPtr) -> i64 {
+fn read_ref_count_sum_relaxed(counters: ShardedDataPtr<AtomicTaggedCounter>) -> i64 {
     let mut sum: i64 = 0;
 
-    let counters = unsafe { fat_ptr.get_counters().as_ref() };
-
     for shard_index in shard_indexes() {
+        let atomic_counter = unsafe { counters.ptr_at_shard(shard_index).as_ref() };
+
         // Why use Relaxed ordering: it's just a pre-check
-        let tagged_counter = counters[shard_index].load_relaxed();
+        let tagged_counter = atomic_counter.load_relaxed();
         sum += tagged_counter.ref_count();
     }
 
     sum
 }
 
-fn clear_tags_and_read_ref_count_sum_relaxed(fat_ptr: SdarcInnerFatPtr) -> i64 {
+fn clear_tags_and_read_ref_count_sum_relaxed(counters: ShardedDataPtr<AtomicTaggedCounter>) -> i64 {
     let mut sum: i64 = 0;
 
-    let counters = unsafe { fat_ptr.get_counters().as_ref() };
-
     for shard_index in shard_indexes() {
+        let atomic_counter = unsafe { counters.ptr_at_shard(shard_index).as_ref() };
+
         /// Why use Relaxed ordering: the [`read_ref_count_sum_if_all_tags_unset_acquire`]
         /// during re-check ensures correctness.
-        let tagged_counter = counters[shard_index].fetch_and_clear_tag_relaxed();
+        let tagged_counter = atomic_counter.fetch_and_clear_tag_relaxed();
         sum += tagged_counter.ref_count();
     }
 
@@ -251,14 +256,16 @@ fn clear_tags_and_read_ref_count_sum_relaxed(fat_ptr: SdarcInnerFatPtr) -> i64 {
 ///   it cannot observe zero sum.
 /// - If the increment comes from loading atomic pointer or weak ref upgrade,
 ///   reader critical section will ensure collector observes incremented counter.
-fn read_ref_count_sum_if_all_tags_unset_acquire(fat_ptr: SdarcInnerFatPtr) -> Option<i64> {
+fn read_ref_count_sum_if_all_tags_unset_acquire(
+    counters: ShardedDataPtr<AtomicTaggedCounter>,
+) -> Option<i64> {
     let mut sum: i64 = 0;
 
-    let counters = unsafe { fat_ptr.get_counters().as_ref() };
-
     for shard_index in shard_indexes() {
+        let atomic_counter = unsafe { counters.ptr_at_shard(shard_index).as_ref() };
+
         // Why use Acquire ordering: see function doc
-        let tagged_counter = counters[shard_index].load_acquire();
+        let tagged_counter = atomic_counter.load_acquire();
         if tagged_counter.tag() {
             return None;
         }
@@ -272,7 +279,7 @@ impl CollectorThreadState {
     fn update(&mut self) {
         self.take_new_counters_to_track();
 
-        self.do_sdarc_collection();
+        self.do_collection_inner_iterations();
 
         FULL_SHARD_ALLOC.do_maintenance_by_collector();
 
@@ -281,17 +288,34 @@ impl CollectorThreadState {
         }
     }
 
-    fn do_sdarc_collection(&mut self) {
+    fn do_collection_inner_iterations(&mut self) {
+        let inner_iter_counter = &self.collector.inner_iteration_counter;
+        let inner_iter_count = inner_iter_counter.fetch_add(1, Ordering::Relaxed);
+
+        debug!("Inner iteration {inner_iter_count} started");
+
         let mut to_re_check =
             self.update_all_tracked_counters_and_collect_and_get_ptrs_to_re_check();
 
+        let mut loop_counter: u64 = 0;
         loop {
             if to_re_check.is_empty() {
                 return;
             }
 
+            let inner_iter_count = inner_iter_counter.fetch_add(1, Ordering::Relaxed);
+            debug!("Inner iteration {inner_iter_count} started for re-checking");
+
             to_re_check =
                 self.update_specific_counters_and_collect_and_get_ptrs_to_re_check(to_re_check);
+
+            loop_counter += 1;
+            if loop_counter == 100000 {
+                warn!(
+                    "Two many inner iterations in one outer iteration. It's either caused by user frees a very deep structure made of Sdarc, or there is a bug. Exiting the inner iteration loop."
+                );
+                break;
+            }
         }
     }
 
@@ -305,7 +329,7 @@ impl CollectorThreadState {
         let mut new_to_re_check: BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> = BTreeSet::new();
 
         for (counters_ptr, tracked_counter) in &mut self.tracked_counters {
-            tracked_counter.update_state();
+            tracked_counter.update_state(*counters_ptr);
             match &tracked_counter.state {
                 TrackedCounterState::DefaultState => {}
                 TrackedCounterState::RequiresReChecking => {
@@ -339,10 +363,14 @@ impl CollectorThreadState {
         for counters_ptr in old_to_recheck {
             match self.tracked_counters.get_mut(&counters_ptr) {
                 None => {
-                    panic!("Cannot find tracked counter {counters_ptr:?}")
+                    /// It's possible that user type's drop creates new Sdarc then drop,
+                    /// in current outer iteration [`Self::take_new_counters_to_track`] won't be called,
+                    /// so the counter stays untracked.
+                    /// Just ignore it.
+                    continue;
                 }
                 Some(tracked_counter) => {
-                    tracked_counter.update_state();
+                    tracked_counter.update_state(counters_ptr);
                     match &tracked_counter.state {
                         TrackedCounterState::DefaultState => {}
                         TrackedCounterState::RequiresReChecking => {
@@ -372,6 +400,9 @@ impl CollectorThreadState {
             ));
 
             let fat_ptr = tracked_counter.fat_ptr;
+
+            assert_eq!(fat_ptr.get_counters_ptr(), *counters_ptr);
+
             let res = panic::catch_unwind(move || {
                 fat_ptr.free();
             });
@@ -418,8 +449,8 @@ fn collector_thread_main() {
 
     loop {
         // This counter is just for logging, Relaxed ordering is fine
-        let iteration_counter = collector
-            .collection_iteration_counter
+        let outer_iteration_counter = collector
+            .outer_iteration_counter
             .fetch_add(1, Ordering::Relaxed);
 
         let iteration_start_time = Instant::now();
@@ -428,7 +459,7 @@ fn collector_thread_main() {
 
         let elapsed_time = iteration_start_time.elapsed();
 
-        debug!("Collection iteration {iteration_counter} took {elapsed_time:?}");
+        debug!("Collection outer iteration {outer_iteration_counter} took {elapsed_time:?}");
 
         let to_wait = collector.params.interval.saturating_sub(elapsed_time);
 

@@ -1,7 +1,7 @@
 use crate::collector;
 use crate::collector::on_new_sdarc_allocated;
 use crate::reader_critical_section::READER_CRITICAL_SECTION;
-use crate::sharded_alloc::ShardedBox;
+use crate::sharded_alloc::{ShardedBox, ShardedDataPtr};
 use crate::tagged_counter::AtomicTaggedCounter;
 use std::any::type_name;
 use std::fmt::{Debug, Formatter};
@@ -243,12 +243,14 @@ pub(crate) struct SdarcInnerFatPtr {
 }
 
 impl SdarcInnerFatPtr {
-    pub fn get_counters(self) -> NonNull<ShardedBox<AtomicTaggedCounter>> {
+    pub fn get_counters_ptr(self) -> ShardedDataPtr<AtomicTaggedCounter> {
         unsafe {
             self.ptr
                 .0
                 .offset(self.vtable_ref.offset_of_counter as isize)
                 .cast::<ShardedBox<AtomicTaggedCounter>>()
+                .as_ref()
+                .0
         }
     }
 
