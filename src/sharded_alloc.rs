@@ -13,7 +13,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem;
-use std::ops::{DerefMut, Index, IndexMut, Not};
+use std::ops::{DerefMut, Index, IndexMut, Not, Sub};
 use std::ptr::{NonNull, drop_in_place};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -247,7 +247,7 @@ impl AllocUnitGroup {
 }
 
 pub(crate) struct FullShardAlloc {
-    shards_to_allocate: ShardsArr<CachePadded<RwLock<AllocUnitGroup>>>,
+    groups: ShardsArr<CachePadded<Mutex<AllocUnitGroup>>>,
 
     /// The collector will do maintenance for each group.
     /// But maintenance is O(n) and maintenance takes lock.
@@ -261,9 +261,9 @@ pub(crate) struct FullShardAlloc {
 impl FullShardAlloc {
     fn initialize() -> FullShardAlloc {
         let shards =
-            ShardsArr::new(|_shard_index| CachePadded::new(RwLock::new(AllocUnitGroup::new())));
+            ShardsArr::new(|_shard_index| CachePadded::new(Mutex::new(AllocUnitGroup::new())));
         FullShardAlloc {
-            shards_to_allocate: shards,
+            groups: shards,
             temp_filling_group: Mutex::new(AllocUnitGroup::new()),
         }
     }
@@ -273,9 +273,9 @@ impl FullShardAlloc {
         init_func: impl Fn(ShardIndex) -> T,
     ) -> ShardedDataPtr<T> {
         let shard_index = curr_thread_shard_index();
-        let shard = &self.shards_to_allocate[shard_index];
+        let shard = &self.groups[shard_index];
 
-        let mut g = shard.write();
+        let mut g = shard.lock();
         g.allocate::<T>(&init_func)
     }
 
@@ -283,12 +283,12 @@ impl FullShardAlloc {
         let mut filling_group_guard = self.temp_filling_group.lock();
 
         for shard_index in shard_indexes() {
-            let shard = &self.shards_to_allocate[shard_index];
+            let shard = &self.groups[shard_index];
 
             // swap with the filling group, then do maintenance, then swap back.
             // the maintenance is O(n). this ensures collector doing maintenance won't block allocation for long time
             {
-                let mut shard_group_guard = shard.write();
+                let mut shard_group_guard = shard.lock();
                 mem::swap(
                     shard_group_guard.deref_mut(),
                     filling_group_guard.deref_mut(),
@@ -298,7 +298,7 @@ impl FullShardAlloc {
             filling_group_guard.do_maintenance();
 
             {
-                let mut shard_group_guard = shard.write();
+                let mut shard_group_guard = shard.lock();
                 mem::swap(
                     shard_group_guard.deref_mut(),
                     filling_group_guard.deref_mut(),
@@ -309,38 +309,72 @@ impl FullShardAlloc {
         filling_group_guard.do_maintenance();
     }
 
-    pub(crate) fn log_status_in_trace_level(&self) {
-        let mut total_unused_slot_count = 0;
-        let mut total_slot_count = 0;
+    fn get_status_report(&self) -> ShardedAllocStatusReport {
+        // Collector can run in parallel and swap shards thus make number inaccurate. Lock all locks to prevent.
+        let temp_guard = self.temp_filling_group.lock();
+        let shard_guards: Vec<_> = shard_indexes()
+            .map(|i| self.groups[i].lock())
+            .collect();
 
-        for shard_index in shard_indexes() {
-            let shard = &self.shards_to_allocate[shard_index];
-            let guard = shard.write();
-            let (unused_slot_count, slot_count) =
-                guard.count_unused_slot_count_and_all_slot_count();
-            trace!("ShardedAllocator {shard_index:?} unused {unused_slot_count} all {slot_count}");
-            total_unused_slot_count += unused_slot_count;
-            total_slot_count += slot_count;
+        let mut per_shard: Vec<(usize, usize)> = Vec::with_capacity(get_shard_count().as_usize());
+        let mut total_unused: usize = 0;
+        let mut total_slots: usize = 0;
+
+        for guard in &shard_guards {
+            let (unused, slots) = guard.count_unused_slot_count_and_all_slot_count();
+            per_shard.push((unused, slots));
+            total_unused += unused;
+            total_slots += slots;
         }
 
-        {
-            let guard = self.temp_filling_group.lock();
-            let (unused_slot_count, slot_count) =
-                guard.count_unused_slot_count_and_all_slot_count();
-            trace!("ShardedAllocator filling shard unused {unused_slot_count} all {slot_count}");
-            total_unused_slot_count += unused_slot_count;
-            total_slot_count += slot_count;
-        }
+        let (filling_unused, filling_slots) =
+            temp_guard.count_unused_slot_count_and_all_slot_count();
 
-        if total_slot_count != 0 {
-            let fragment_rate = (total_unused_slot_count as f64) / (total_slot_count as f64);
+        total_unused += filling_unused;
+        total_slots += filling_slots;
 
-            trace!(
-                "ShardedAllocator fragment rate {:.1}%",
-                fragment_rate * 100.0
-            );
+        drop(shard_guards);
+        drop(temp_guard);
+
+        ShardedAllocStatusReport {
+            per_shard,
+            filling_group: (filling_unused, filling_slots),
+            total_used: total_slots.sub(total_unused),
+            fragment_rate: if total_slots != 0 {
+                total_unused as f64 / total_slots as f64
+            } else {
+                0.0
+            },
         }
     }
+
+    pub(crate) fn log_status_in_trace_level(&self) {
+        let report = self.get_status_report();
+        for (i, &(unused, slots)) in report.per_shard.iter().enumerate() {
+            trace!("ShardedAllocator shard {i} unused {unused} all {slots}");
+        }
+        trace!(
+            "ShardedAllocator filling shard unused {} all {}",
+            report.filling_group.0,
+            report.filling_group.1,
+        );
+        trace!(
+            "ShardedAllocator fragment rate {:.1}%",
+            report.fragment_rate * 100.0,
+        );
+    }
+}
+
+struct ShardedAllocStatusReport {
+    /// (unused, total) per shard, indexed by shard number
+    per_shard: Vec<(usize, usize)>,
+    /// (unused, total) for the temp filling group
+    filling_group: (usize, usize),
+    /// computed: total_slots - total_unused
+    #[allow(dead_code)]
+    total_used: usize,
+    /// computed: total_unused / total_slots (0.0 if no slots)
+    fragment_rate: f64,
 }
 
 pub(crate) static FULL_SHARD_ALLOC: LazyLock<FullShardAlloc> =
@@ -349,27 +383,9 @@ pub(crate) static FULL_SHARD_ALLOC: LazyLock<FullShardAlloc> =
 /// Returns the total number of sharded-alloc slots currently marked as used.
 /// For leak-checking in tests: when everything is dropped except the
 /// reader-critical-section counter, the count should be exactly 1.
+#[cfg(test)]
 pub(crate) fn total_sharded_alloc_used_slots() -> usize {
-    let alloc = &FULL_SHARD_ALLOC;
-    let mut total_unused: usize = 0;
-    let mut total_slots: usize = 0;
-
-    for shard_index in shard_indexes() {
-        let shard = &alloc.shards_to_allocate[shard_index];
-        let guard = shard.read();
-        let (unused, slots) = guard.count_unused_slot_count_and_all_slot_count();
-        total_unused += unused;
-        total_slots += slots;
-    }
-
-    {
-        let guard = alloc.temp_filling_group.lock();
-        let (unused, slots) = guard.count_unused_slot_count_and_all_slot_count();
-        total_unused += unused;
-        total_slots += slots;
-    }
-
-    total_slots.saturating_sub(total_unused)
+    FULL_SHARD_ALLOC.get_status_report().total_used
 }
 
 /// It represents pointer to a piece of data in same offset in every shard.

@@ -15,3 +15,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 rusty-fork = "0.3"
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
+
+[[bench]]
+name = "collector_bench"
+harness = false

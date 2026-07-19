@@ -11,7 +11,7 @@ use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, atomic};
+use std::sync::{OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 use std::{mem, panic, thread};
@@ -176,7 +176,7 @@ pub fn collector_update_now_and_wait() {
 
     let mut guard = collector.status_mutex.lock();
 
-    // unpark after holding mutex. this avoids waiting for two iterations rather than one iteration
+    // unpark after holding mutex
     collector.thread_handle.thread().unpark();
 
     let state_when_start_waiting = *guard;
