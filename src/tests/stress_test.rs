@@ -1,9 +1,13 @@
 //! Stress test that can run in Miri.
 //!
 //! Exercises the same patterns as the full stress test — `Sdarc` clone/drop,
-//! `AtomicSdarc` load/store/swap, `WeakSdarc` downgrade/upgrade, cross-thread
-//! message passing, and short-lived child threads — but with `std::thread` only
-//! and small iteration counts so Miri finishes in reasonable time.
+//! `AtomicSdarc` load/store/swap/borrow (hazard-pointer path), `WeakSdarc`
+//! downgrade/upgrade, cross-thread message passing, and short-lived child
+//! threads — but with `std::thread` only.
+//!
+//! Iteration counts and thread counts are selected with `cfg(miri)`: full
+//! values for native runs, much smaller values under Miri so it finishes in
+//! reasonable time.
 //!
 //! All setup/thread code is wrapped in `{}` so that every `Sdarc` reference
 //! is guaranteed dropped before `collector_update_now_and_wait()` is called.
@@ -124,6 +128,7 @@ struct SharedContext {
     swaps: AtomicU64,
     forwards: AtomicU64,
     spawns: AtomicU64,
+    borrows: AtomicU64,
     invariant_ok: AtomicBool,
 
     /// Stop signal.
@@ -144,6 +149,7 @@ impl SharedContext {
             swaps: AtomicU64::new(0),
             forwards: AtomicU64::new(0),
             spawns: AtomicU64::new(0),
+            borrows: AtomicU64::new(0),
             invariant_ok: AtomicBool::new(true),
             stop: AtomicBool::new(false),
         }
@@ -151,33 +157,61 @@ impl SharedContext {
 }
 
 // ===========================================================================
-// Per-iteration counts — small so Miri can finish.
+// Per-iteration counts — much smaller under Miri so it can finish.
 // ===========================================================================
 
 /// Number of iterations each worker thread performs.
-const WORKER_ITERATIONS: usize = 200;
-
+#[cfg(not(miri))]
+const WORKER_ITERATIONS: usize = 200000;
+#[cfg(miri)]
+const WORKER_ITERATIONS: usize = 300;
 
 /// Number of iterations the background updater performs.
-const UPDATER_ITERATIONS: usize = 30;
-
+#[cfg(not(miri))]
+const UPDATER_ITERATIONS: usize = 300000;
+#[cfg(miri)]
+const UPDATER_ITERATIONS: usize = 400;
 
 /// Number of iterations each producer performs.
-const PRODUCER_ITERATIONS: usize = 150;
+#[cfg(not(miri))]
+const PRODUCER_ITERATIONS: usize = 150000;
+#[cfg(miri)]
+const PRODUCER_ITERATIONS: usize = 200;
 
+/// Number of iterations each borrower thread performs.
+#[cfg(not(miri))]
+const BORROWER_ITERATIONS: usize = 400000;
+#[cfg(miri)]
+const BORROWER_ITERATIONS: usize = 500;
 
 /// Number of std worker threads.
-const STD_WORKERS: usize = 4;
-
+#[cfg(not(miri))]
+const STD_WORKERS: usize = 10;
+#[cfg(miri)]
+const STD_WORKERS: usize = 3;
 
 /// Number of producer threads.
+#[cfg(not(miri))]
+const PRODUCERS: usize = 10;
+#[cfg(miri)]
 const PRODUCERS: usize = 2;
 
-/// Size of the hot pool.
-const HOT_POOL_SIZE: usize = 40;
+/// Number of borrower threads hammering `AtomicSdarc::borrow`.
+#[cfg(not(miri))]
+const BORROWERS: usize = 4;
+#[cfg(miri)]
+const BORROWERS: usize = 2;
 
+/// Size of the hot pool.
+#[cfg(not(miri))]
+const HOT_POOL_SIZE: usize = 40;
+#[cfg(miri)]
+const HOT_POOL_SIZE: usize = 8;
 
 /// Maximum spawned child threads per worker.
+#[cfg(not(miri))]
+const MAX_SPAWNED_CHILDREN: usize = 40;
+#[cfg(miri)]
 const MAX_SPAWNED_CHILDREN: usize = 4;
 
 /// Maximum held entries per worker before truncation.
@@ -197,6 +231,7 @@ fn scenario_stress() {
     let swaps;
     let forwards;
     let spawns;
+    let borrows;
     let invariant_ok;
 
     // ---- All Sdarc references live inside this block ----
@@ -260,7 +295,7 @@ fn scenario_stress() {
                         if ctx.stop.load(Ordering::Relaxed) {
                             break;
                         }
-                        let cache = ctx.atomic_cache.load();
+                        let cache = ctx.atomic_cache.load_owned();
                         if !cache.is_empty() {
                             let keys: Vec<u64> = cache.keys().copied().collect();
                             let k = keys[rng.usize(keys.len())];
@@ -278,7 +313,44 @@ fn scenario_stress() {
             .collect();
 
         // =====================================================================
-        // 3. Std worker threads
+        // 3. Borrower threads — hammer `AtomicSdarc::borrow` while the
+        //    updater swaps the cache. Exercises the hazard-pointer path and
+        //    the owned-load fallback under contention.
+        // =====================================================================
+        let borrower_ctx = context.clone();
+        let borrowers: Vec<thread::JoinHandle<()>> = (0..BORROWERS)
+            .map(|b| {
+                let ctx = borrower_ctx.clone();
+                thread::spawn(move || {
+                    let mut rng = CheapRng::new((b + 500) as u64 * 0x85ebca6b);
+                    for _ in 0..BORROWER_ITERATIONS {
+                        if ctx.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        {
+                            let guard = ctx.atomic_cache.borrow();
+                            if !guard.is_empty() {
+                                // The borrowed map is immutable while borrowed,
+                                // and no generation-0 entry may ever be visible.
+                                for entry in guard.values() {
+                                    if entry.generation == 0 {
+                                        ctx.invariant_ok.store(false, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            // guard dropped here, hazard pointer unpublished
+                        }
+                        ctx.borrows.fetch_add(1, Ordering::Relaxed);
+                        if rng.bool(30) {
+                            thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // =====================================================================
+        // 4. Std worker threads
         // =====================================================================
         let worker_barrier = std::sync::Arc::new(Barrier::new(STD_WORKERS));
         let worker_senders_shared = worker_senders.clone();
@@ -310,10 +382,10 @@ fn scenario_stress() {
                             ctx.ops.fetch_add(1, Ordering::Relaxed);
                         }
 
-                        match rng.usize(8) {
+                        match rng.usize(10) {
                             0 => {
                                 // Load cache, clone entry.
-                                let cache = ctx.atomic_cache.load();
+                                let cache = ctx.atomic_cache.load_owned();
                                 if !cache.is_empty() {
                                     let keys: Vec<u64> = cache.keys().copied().collect();
                                     let k = keys[rng.usize(keys.len())];
@@ -399,6 +471,32 @@ fn scenario_stress() {
                                     }
                                 }
                             }
+                            8 => {
+                                // Borrow the cache via hazard pointer, clone an entry.
+                                let guard = ctx.atomic_cache.borrow();
+                                if !guard.is_empty() {
+                                    let keys: Vec<u64> = guard.keys().copied().collect();
+                                    let k = keys[rng.usize(keys.len())];
+                                    if let Some(entry) = guard.get(&k) {
+                                        if entry.generation == 0 {
+                                            ctx.invariant_ok.store(false, Ordering::Relaxed);
+                                        }
+                                        hand.push(Sdarc::new(entry.clone()));
+                                    }
+                                }
+                                drop(guard);
+                                ctx.borrows.fetch_add(1, Ordering::Relaxed);
+                            }
+                            9 => {
+                                // Hold several borrows alive at once to exercise
+                                // multiple hazard pointer slots per thread.
+                                let g1 = ctx.atomic_cache.borrow();
+                                let g2 = ctx.atomic_cache.borrow();
+                                let g3 = ctx.atomic_cache.borrow();
+                                let len_sum = g1.len() + g2.len() + g3.len();
+                                let _ = std::hint::black_box(len_sum);
+                                ctx.borrows.fetch_add(3, Ordering::Relaxed);
+                            }
                             _ => unreachable!(),
                         }
 
@@ -433,6 +531,9 @@ fn scenario_stress() {
         for p in producers {
             p.join().unwrap();
         }
+        for b in borrowers {
+            b.join().unwrap();
+        }
         for w in workers {
             w.join().unwrap();
         }
@@ -445,6 +546,7 @@ fn scenario_stress() {
         swaps = context.swaps.load(Ordering::Relaxed);
         forwards = context.forwards.load(Ordering::Relaxed);
         spawns = context.spawns.load(Ordering::Relaxed);
+        borrows = context.borrows.load(Ordering::Relaxed);
         invariant_ok = context.invariant_ok.load(Ordering::Relaxed);
 
         // Drain real channels (receivers were moved into workers and dropped
@@ -458,7 +560,7 @@ fn scenario_stress() {
     }
 
     eprintln!(
-        "=== stress done ===\n  ops={ops}  up(ok={upgrades_ok} fail={upgrades_fail})  swaps={swaps}  fwd={forwards}  spawns={spawns}",
+        "=== stress done ===\n  ops={ops}  up(ok={upgrades_ok} fail={upgrades_fail})  swaps={swaps}  fwd={forwards}  spawns={spawns}  borrows={borrows}",
     );
 
     assert!(invariant_ok, "invariant violated");
@@ -481,8 +583,8 @@ fn scenario_stress() {
         "TrackedDrop leak: {remaining} instances still alive"
     );
     assert_eq!(
-        used_slots, 1,
-        "sharded alloc leak: {used_slots} slots still used (expected 1 for critical-section counter)"
+        used_slots, 0,
+        "sharded alloc leak: {used_slots} slots still used"
     );
 }
 
@@ -497,7 +599,7 @@ fn stress_test() {
     let collector_params = crate::env_params::CollectorParams::new_from_env_var();
     let disable_maintenance = crate::env_params::disable_sharded_alloc_maintenance();
 
-    eprintln!(
+    println!(
         "=== stress config: shard_count={}, collector_interval_ms={}, disable_maintenance={} ===",
         shard_count.map_or("default".to_string(), |s| s.as_usize().to_string()),
         collector_params.interval.as_millis(),
@@ -507,5 +609,7 @@ fn stress_test() {
     scenario_stress();
 }
 
-// How to run: `MIRIFLAGS=-Zmiri-ignore-leaks RUST_SDARC_SHARD_COUNT=4 RUST_SDARC_COLLECTOR_INTERVAL_MS=0 RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE=1 cargo +nightly miri test miri_stress -- --nocapture`
+// How to run:
+// MIRIFLAGS="-Zmiri-ignore-leaks -Zmiri-env-forward=RUST_SDARC_SHARD_COUNT -Zmiri-env-forward=RUST_SDARC_COLLECTOR_INTERVAL_MS -Zmiri-env-forward=RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE" RUST_SDARC_SHARD_COUNT=4 RUST_SDARC_COLLECTOR_INTERVAL_MS=0 RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE=1 cargo +nightly miri test stress_test -- --nocapture
+// cannot run it with miri in windows due to parking_lot compatibility
 // the collector not exiting when app finishes is normal behavior. without miri-ignore-leaks it will treat it as leak.

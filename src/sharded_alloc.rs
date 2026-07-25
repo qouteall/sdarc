@@ -5,7 +5,6 @@ use crate::shard_index::{
     ShardIndex, ShardsArr, curr_thread_shard_index, get_shard_count, shard_indexes,
     shard_indexes_until,
 };
-use crossbeam::utils::CachePadded;
 use log::trace;
 use parking_lot::{Mutex};
 use scopeguard::guard_on_unwind;
@@ -17,6 +16,7 @@ use std::ops::{DerefMut, Index, IndexMut, Not, Sub};
 use std::ptr::{NonNull, drop_in_place};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use crossbeam_utils::CachePadded;
 use crate::env_params::disable_sharded_alloc_maintenance;
 
 /// Each slot is 8 bytes (same size as `u64`).
@@ -344,7 +344,7 @@ impl FullShardAlloc {
         ShardedAllocStatusReport {
             per_shard,
             filling_group: PerGroupStatusReport {
-                unused_slot_count: filling_group_all_slot_count,
+                unused_slot_count: filling_group_unused_slot_count,
                 all_slot_count: filling_group_all_slot_count,
             },
             total_used_slot_count: total_slots.sub(total_unused),

@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use sdarc::atomic_sdarc::AtomicSdarc;
 use sdarc::sdarc::{ Sdarc};
-use sdarc::shard_index::{get_shard_count};
+use sdarc::shard_index::{get_shard_count, set_current_thread_shard_index, ShardIndex};
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -21,10 +21,13 @@ fn parallelism() -> usize {
 
 const OPS_PER_THREAD: u64 = 50_000;
 
-fn run_threads(num: usize, f: impl Fn() + Send + Sync + Clone + 'static) {
+fn run_threads(num: usize, set_shard_index: bool, f: impl Fn() + Send + Sync + Clone + 'static) {
     let barrier = Arc::new(Barrier::new(num));
     let handles: Vec<_> = (0..num)
-        .map(|_| {
+        .map(|i| {
+            if set_shard_index {
+                set_current_thread_shard_index(ShardIndex::from_u64(i as u64))
+            }
             let b = Arc::clone(&barrier);
             let f = f.clone();
             thread::spawn(move || {
@@ -45,10 +48,11 @@ fn run_threads(num: usize, f: impl Fn() + Send + Sync + Clone + 'static) {
 fn bench_atomic_read_throughput(c: &mut Criterion) {
     println!("Shard count {:?}", get_shard_count());
 
+    assert!(membarrier2::is_supported());
+
     let num_readers = parallelism();
     let payload = vec![0i64; 64];
 
-    // ---------- AtomicSdarc ----------
     {
         let shared = Arc::new(AtomicSdarc::new(payload.clone()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -65,15 +69,15 @@ fn bench_atomic_read_throughput(c: &mut Criterion) {
             }
         });
 
-        c.bench_function("atomic_read/AtomicSdarc", |b| {
+        c.bench_function("AtomicSdarc load_owned (no set shard id)", |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
                     let s = Arc::clone(&shared);
                     let start = Instant::now();
-                    run_threads(num_readers, move || {
+                    run_threads(num_readers, false, move || {
                         for _ in 0..OPS_PER_THREAD {
-                            let val = s.load();
+                            let val = s.load_owned();
                             black_box(val[0]);
                         }
                     });
@@ -86,6 +90,84 @@ fn bench_atomic_read_throughput(c: &mut Criterion) {
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
     }
+
+    {
+        let shared = Arc::new(AtomicSdarc::new(payload.clone()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // background writer — swaps a new Vec every 200 ms
+        let w_shared = Arc::clone(&shared);
+        let w_stop = Arc::clone(&stop);
+        let writer = thread::spawn(move || {
+            let mut generation = 0u64;
+            while !w_stop.load(Ordering::Relaxed) {
+                generation += 1;
+                w_shared.swap(Sdarc::new(vec![generation as i64; 64]));
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+
+        c.bench_function("AtomicSdarc load_owned (sets shard id)", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let s = Arc::clone(&shared);
+                    let start = Instant::now();
+                    run_threads(num_readers, true, move || {
+                        for _ in 0..OPS_PER_THREAD {
+                            let val = s.load_owned();
+                            black_box(val[0]);
+                        }
+                    });
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+    }
+
+
+    {
+        let shared = Arc::new(AtomicSdarc::new(payload.clone()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // background writer — swaps a new Vec every 200 ms
+        let w_shared = Arc::clone(&shared);
+        let w_stop = Arc::clone(&stop);
+        let writer = thread::spawn(move || {
+            let mut generation = 0u64;
+            while !w_stop.load(Ordering::Relaxed) {
+                generation += 1;
+                w_shared.swap(Sdarc::new(vec![generation as i64; 64]));
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+
+        c.bench_function("AtomicSdarc borrow", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let s = Arc::clone(&shared);
+                    let start = Instant::now();
+                    run_threads(num_readers, false, move || {
+                        for _ in 0..OPS_PER_THREAD {
+                            let val = s.borrow();
+                            black_box(val[0]);
+                        }
+                    });
+                    total += start.elapsed();
+                }
+                total
+            });
+        });
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+    }
+
 
     // ---------- ArcSwap ----------
     {
@@ -103,13 +185,13 @@ fn bench_atomic_read_throughput(c: &mut Criterion) {
             }
         });
 
-        c.bench_function("atomic_read/ArcSwap", |b| {
+        c.bench_function("ArcSwap load", |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
                     let s = Arc::clone(&shared);
                     let start = Instant::now();
-                    run_threads(num_readers, move || {
+                    run_threads(num_readers, false,move || {
                         for _ in 0..OPS_PER_THREAD {
                             let val = s.load();
                             black_box(val[0]);
@@ -143,7 +225,7 @@ fn bench_clone_drop_contention(c: &mut Criterion) {
                 for _ in 0..iters {
                     let s = shared.clone();
                     let start = Instant::now();
-                    run_threads(num_threads, move || {
+                    run_threads(num_threads, false, move || {
                         for _ in 0..OPS_PER_THREAD {
                             let c = s.clone();
                             black_box(&c);
@@ -167,7 +249,7 @@ fn bench_clone_drop_contention(c: &mut Criterion) {
                 for _ in 0..iters {
                     let s = Arc::clone(&shared);
                     let start = Instant::now();
-                    run_threads(num_threads, move || {
+                    run_threads(num_threads, false, move || {
                         for _ in 0..OPS_PER_THREAD {
                             let c = Arc::clone(&s);
                             black_box(&c);
@@ -244,3 +326,5 @@ criterion_group! {
     targets = bench_atomic_read_throughput, bench_clone_drop_contention, bench_clone_drop_single_thread
 }
 criterion_main!(benches);
+
+// cargo flamegraph --bench comparison_bench -- --bench "AtomicSdarc borrow"

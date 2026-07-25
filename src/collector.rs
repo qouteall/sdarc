@@ -1,16 +1,16 @@
+use crate::atomic_sdarc::traverse_atomic_reader_signals;
 use crate::env_params::CollectorParams;
-use crate::atomic_sdarc::{HazardPointerSet, traverse_atomic_reader_signals};
 use crate::sdarc::SdarcInnerFatPtr;
 use crate::shard_index::{ShardsArr, shard_indexes};
 use crate::sharded_alloc::{FULL_SHARD_ALLOC, ShardedDataPtr};
 use crate::tagged_counter::AtomicTaggedCounter;
 use crate::weak_sdarc::ClearWeakBackRefResult;
-use crossbeam::utils::CachePadded;
+use crossbeam_utils::CachePadded;
 use log::{debug, error, warn};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::{Deref, DerefMut};
+use std::ops::{Deref, DerefMut, Not};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -34,58 +34,7 @@ pub(crate) struct CollectorShared {
     outer_iteration_counter: AtomicU64,
     inner_iteration_counter: AtomicU64,
 
-    /// The mutex and condvar is used for
-    status_mutex: Mutex<CollectorState>,
-    status_condvar: Condvar,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CollectorState {
-    Waiting { finished_iteration_counter: u64 },
-    Running { working_on_iteration_counter: u64 },
-}
-
-impl CollectorState {
-    fn to_serial_number(self) -> u64 {
-        match self {
-            CollectorState::Running {
-                working_on_iteration_counter,
-            } => working_on_iteration_counter * 2,
-            CollectorState::Waiting {
-                finished_iteration_counter,
-            } => finished_iteration_counter * 2 + 1,
-        }
-    }
-
-    /// The [`collector_update_now_and_wait`] needs to wait until one full collection.
-    /// For example, if it's currently working on iteration 3, it has to wait until iteration 4 finishes.
-    /// If it just waits until iteration 3 finishes, the `Sdarc` whose ref count sum becomes 0 during iteration 3 may be not collected.
-    fn after_at_least_one_full_collection(self) -> CollectorState {
-        match self {
-            CollectorState::Waiting {
-                finished_iteration_counter: now_finished,
-            } => CollectorState::Waiting {
-                finished_iteration_counter: now_finished + 1,
-            },
-            CollectorState::Running {
-                working_on_iteration_counter: now_working_on,
-            } => CollectorState::Waiting {
-                finished_iteration_counter: now_working_on + 1,
-            },
-        }
-    }
-}
-
-impl Ord for CollectorState {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.to_serial_number().cmp(&other.to_serial_number())
-    }
-}
-
-impl PartialOrd for CollectorState {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
+    collection_waiting: Mutex<Vec<oneshot::Sender<()>>>,
 }
 
 pub(crate) struct CollectorPendingDataShard {
@@ -104,25 +53,7 @@ impl CollectorShared {
     fn new(params: CollectorParams) -> Self {
         Self {
             params,
-            thread_handle: thread::spawn(move || {
-                let r = panic::catch_unwind(|| collector_thread_main());
-                match r {
-                    Ok(()) => {
-                        error!("Collector main should not finish.")
-                    }
-                    Err(any_err) => {
-                        let msg = if let Some(s) = any_err.downcast_ref::<&str>() {
-                            s.to_string()
-                        } else if let Some(s) = any_err.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "non-string panic payload".to_string()
-                        };
-                        error!("Collector panicked {msg}");
-                        eprintln!("Collector panicked {msg}");
-                    }
-                }
-            }),
+            thread_handle: thread::spawn(move || collector_thread_main()),
             // The CachePadded ensure the rwlock and vec's outer 3 fields (ptr, length and capacity) are in unique cache lines.
             // The 8 ensures initial inner spaces are in unique cache lines.
             pending_to_track: ShardsArr::new(|_| {
@@ -130,10 +61,7 @@ impl CollectorShared {
             }),
             outer_iteration_counter: AtomicU64::new(0),
             inner_iteration_counter: AtomicU64::new(0),
-            status_mutex: Mutex::new(CollectorState::Waiting {
-                finished_iteration_counter: 0,
-            }),
-            status_condvar: Condvar::new(),
+            collection_waiting: Mutex::new(Vec::new()),
         }
     }
 
@@ -171,21 +99,34 @@ pub fn collector_update_now() {
     // No need to add extra memory fences. The park synchronizes-with unpark.
 }
 
-/// Interrupt the collector from parking, and wait until it finishes one full collection.
+/// Interrupt the collector from parking, and wait until it finishes one deep collection.
+///
+/// Note: normally collector does shallow collection. For a deep structure it will collect layer-by-layer.
+/// Calling this makes collector do deep collection once.
+///
+/// Why doesn't collector do deep collection by default:
+/// Collection uses heavy fence. The heavy fence sends interrupt to all CPU cores running
+/// thread in current process. Interrupting twice per second is fine.
+/// But in deep collection, freeing a 100-layer deep structure uses at least 200 times of heavy barrier
+/// in short time. This may cause unwanted latency in other threads (for example a game running in 144 FPS may become 143 FPS after receiving 200 interrupts in short time). The heavy fence is for safety related to atomic sdarc.
+///
+/// (Maybe in future the asymmetric fence can be changed to normal SeqCst then doing deep collection by default is fine.)
 pub fn collector_update_now_and_wait() {
     let collector = get_collector();
 
-    let mut guard = collector.status_mutex.lock();
+    let (sender, receiver) = oneshot::channel::<()>();
 
-    // unpark after holding mutex
-    collector.thread_handle.thread().unpark();
+    {
+        let mut g = collector.collection_waiting.lock();
+        g.push(sender);
 
-    let state_when_start_waiting = *guard;
-    let state_to_wait_until = state_when_start_waiting.after_at_least_one_full_collection();
+        // unpark while holding lock
+        collector.thread_handle.thread().unpark();
+    }
 
-    collector
-        .status_condvar
-        .wait_while(&mut guard, |curr_state| *curr_state < state_to_wait_until);
+    // recv can only fail if sender is dropped before sending, which doesn't happen
+    // (if collector thread panics it could wait forever)
+    receiver.recv().unwrap();
 }
 
 struct CollectorThreadState {
@@ -224,7 +165,7 @@ impl TrackedCounter {
             TrackedCounterState::DefaultState => {
                 let relaxed_sum = read_ref_count_sum_relaxed(counters);
                 if relaxed_sum == 0 {
-                    let sum = clear_tags_and_read_ref_count_sum_relaxed(counters);
+                    let sum = clear_tags_and_read_ref_count_sum_acquire(counters);
                     if sum == 0 {
                         // counters tagged and observed sum is zero, going to re-check
                         self.state = TrackedCounterState::RequiresReChecking;
@@ -308,7 +249,7 @@ fn read_ref_count_sum_relaxed(counters: ShardedDataPtr<AtomicTaggedCounter>) -> 
     sum
 }
 
-fn clear_tags_and_read_ref_count_sum_relaxed(counters: ShardedDataPtr<AtomicTaggedCounter>) -> i64 {
+fn clear_tags_and_read_ref_count_sum_acquire(counters: ShardedDataPtr<AtomicTaggedCounter>) -> i64 {
     let mut sum: i64 = 0;
 
     for shard_index in shard_indexes() {
@@ -316,7 +257,7 @@ fn clear_tags_and_read_ref_count_sum_relaxed(counters: ShardedDataPtr<AtomicTagg
 
         /// Why use Relaxed ordering: the [`read_ref_count_sum_if_all_tags_unset_acquire`]
         /// during re-check ensures correctness.
-        let tagged_counter = atomic_counter.fetch_and_clear_tag_relaxed();
+        let tagged_counter = atomic_counter.fetch_and_clear_tag_acquire();
         sum += tagged_counter.ref_count();
     }
 
@@ -357,10 +298,10 @@ fn read_ref_count_sum_if_all_tags_unset_acquire(
 }
 
 impl CollectorThreadState {
-    fn update(&mut self) {
+    fn update(&mut self, do_deep_collection: bool) {
         self.take_new_counters_to_track();
 
-        self.do_collection_inner_iterations();
+        self.do_collection_inner_iterations(do_deep_collection);
 
         FULL_SHARD_ALLOC.do_maintenance_by_collector();
 
@@ -369,64 +310,74 @@ impl CollectorThreadState {
         }
     }
 
-    fn do_collection_inner_iterations(&mut self) {
+    fn do_collection_inner_iterations(&mut self, do_deep_collection: bool) {
         let inner_iter_counter = &self.collector.inner_iteration_counter;
         let inner_iter_count = inner_iter_counter.fetch_add(1, Ordering::Relaxed);
 
         debug!("Inner iteration {inner_iter_count} started");
 
-        let mut to_re_check =
-            self.update_all_tracked_counters_and_collect_and_get_ptrs_to_re_check();
+        let to_re_check = self
+            .update_all_tracked_counters_and_collect_and_get_ptrs_to_re_check(do_deep_collection);
 
-        let mut loop_counter: u64 = 0;
-        loop {
-            if to_re_check.is_empty() {
-                return;
-            }
+        if do_deep_collection {
+            let mut to_re_check = to_re_check.unwrap();
 
-            let inner_iter_count = inner_iter_counter.fetch_add(1, Ordering::Relaxed);
-            debug!("Inner iteration {inner_iter_count} started for re-checking");
+            let mut loop_counter: u64 = 0;
+            loop {
+                if to_re_check.is_empty() {
+                    return;
+                }
 
-            to_re_check =
-                self.update_specific_counters_and_collect_and_get_ptrs_to_re_check(to_re_check);
+                let inner_iter_count = inner_iter_counter.fetch_add(1, Ordering::Relaxed);
+                debug!("Inner iteration {inner_iter_count} started for re-checking");
 
-            // Is it possible that the inner iteration loop deadloops?
-            // The new to_re_check have elements in two cases:
-            // 1. A `Sdarc` is dropped when dropping a `SdarcInner` in collector thread
-            // 2. For a `SdarcInner` tracked by previous `to_re_check`, its counter sum is observed to be zero (then counter tags get cleared)
-            // For 1: normally the children Sdarc will be dropped in parent drop. One object dropping can cause
-            // other objects dropping. Normally there is finite objects to be dropped so it won't deadloop.
-            // What if user thread keeps allocating new Sdarc in parallel? Then it will be buffered into pending
-            // track list and won't be tracked in an inner iteration.
-            // What if user type's `drop` creates a new Sdarc and drops? It will still be not tracked immediately.
-            // For 2, it cannot have new element other than previous `to_re_check`.
-            // What if the user type drop clones an existing living Sdarc then drop?
-            // It will not cause deadloop because that Sdarc is living and the pre-check should be non-zero.
-            // What about the race condition where [0, 1] becomes [1, 1] then [1, 0]?
-            // It won't cause memory safety issue because tagged counter will be observed then it delays freeing.
-            // Then its state will become DefaultState ad won't go into to_re_check.
-            // TODO
+                to_re_check =
+                    self.update_specific_counters_and_collect_and_get_ptrs_to_re_check(to_re_check);
 
-            loop_counter += 1;
-            if loop_counter == 100000 {
-                warn!(
-                    "Two many inner iterations in one outer iteration. It's either caused by user frees a very deep structure made of Sdarc, or there is a bug. Exiting the inner iteration loop. {to_re_check:?}"
-                );
-                break;
+                // Is it possible that the inner iteration loop deadloops?
+                // The new to_re_check have elements in two cases:
+                // 1. A `Sdarc` is dropped when dropping a `SdarcInner` in collector thread
+                // 2. For a `SdarcInner` tracked by previous `to_re_check`, its counter sum is observed to be zero (then counter tags get cleared)
+                // For 1: normally the children Sdarc will be dropped in parent drop. One object dropping can cause
+                // other objects dropping. Normally there is finite objects to be dropped so it won't deadloop.
+                // What if user thread keeps allocating new Sdarc in parallel? Then it will be buffered into pending
+                // track list and won't be tracked in an inner iteration.
+                // What if user type's `drop` creates a new Sdarc and drops? It will still be not tracked immediately.
+                // For 2, it cannot have new element other than previous `to_re_check`.
+                // What if the user type drop clones an existing living Sdarc then drop?
+                // It will not cause deadloop because that Sdarc is living and the pre-check should be non-zero.
+                // What about the race condition where [0, 1] becomes [1, 1] then [1, 0]?
+                // It won't cause memory safety issue because tagged counter will be observed then it delays freeing.
+                // Then its state will become DefaultState ad won't go into to_re_check.
+
+                loop_counter += 1;
+                if loop_counter == 100000 {
+                    warn!(
+                        "Too many inner iterations in one outer iteration. It's either caused by user frees a very deep structure made of Sdarc, or there is a bug. Exiting the inner iteration loop. {to_re_check:?}"
+                    );
+                    break;
+                }
             }
         }
     }
 
     fn update_all_tracked_counters_and_collect_and_get_ptrs_to_re_check(
         &mut self,
-    ) -> BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> {
+        do_deep_collection: bool,
+    ) -> Option<BTreeSet<ShardedDataPtr<AtomicTaggedCounter>>> {
         let hazard_pointer_set = traverse_atomic_reader_signals();
 
         let mut to_free: Vec<ShardedDataPtr<AtomicTaggedCounter>> = Vec::new();
-        let mut new_to_re_check: BTreeSet<ShardedDataPtr<AtomicTaggedCounter>> = BTreeSet::new();
+        let mut new_to_re_check: Option<BTreeSet<ShardedDataPtr<AtomicTaggedCounter>>> =
+            if do_deep_collection {
+                Some(BTreeSet::new())
+            } else {
+                None
+            };
 
         for (counters_ptr, tracked_counter) in &mut self.tracked_counters {
             if hazard_pointer_set.contains(tracked_counter.fat_ptr.ptr) {
+                tracked_counter.state = TrackedCounterState::DefaultState;
                 continue;
             }
 
@@ -434,7 +385,9 @@ impl CollectorThreadState {
             match &tracked_counter.state {
                 TrackedCounterState::DefaultState => {}
                 TrackedCounterState::RequiresReChecking => {
-                    new_to_re_check.insert(*counters_ptr);
+                    if let Some(new_to_re_check) = &mut new_to_re_check {
+                        new_to_re_check.insert(*counters_ptr);
+                    }
                 }
                 TrackedCounterState::ReadyToFree => {
                     to_free.push(*counters_ptr);
@@ -446,7 +399,10 @@ impl CollectorThreadState {
 
         let to_recheck_from_thread_local =
             COLLECTOR_THREAD_LOCAL.with(|cell| cell.get().unwrap().take_to_recheck());
-        new_to_re_check.extend(to_recheck_from_thread_local);
+
+        if let Some(new_to_re_check) = &mut new_to_re_check {
+            new_to_re_check.extend(to_recheck_from_thread_local);
+        }
 
         new_to_re_check
     }
@@ -471,6 +427,7 @@ impl CollectorThreadState {
                 }
                 Some(tracked_counter) => {
                     if hazard_pointer_set.contains(tracked_counter.fat_ptr.ptr) {
+                        tracked_counter.state = TrackedCounterState::DefaultState;
                         continue;
                     }
 
@@ -560,18 +517,16 @@ fn collector_thread_main() {
         collector
             .outer_iteration_counter
             .store(outer_iteration_counter, Ordering::Relaxed);
-        {
-            let mut guard = collector.status_mutex.lock();
-            *guard = CollectorState::Running {
-                working_on_iteration_counter: outer_iteration_counter,
-            };
-        }
+
+        let to_notify = { mem::take(collector.collection_waiting.lock().deref_mut()) };
 
         debug!("Collector starts outer iteration {outer_iteration_counter} started");
 
         let iteration_start_time = Instant::now();
 
-        state.update();
+        let should_do_deep_collection = to_notify.is_empty().not();
+
+        state.update(should_do_deep_collection);
 
         let elapsed_time = iteration_start_time.elapsed();
 
@@ -579,19 +534,17 @@ fn collector_thread_main() {
             "Collection outer iteration {outer_iteration_counter} finished. Took {elapsed_time:?}"
         );
 
+        for sender in to_notify {
+            if let Err(_err) = sender.send(()) {
+                error!("Notify collector waiter error");
+            }
+        }
+
         let to_wait = collector.params.interval.saturating_sub(elapsed_time);
 
         debug!("Collector thread is going to wait {to_wait:?}");
 
-        /// Notify waiters in [`collector_update_now_and_wait`]
-        {
-            let mut guard = collector.status_mutex.lock();
-            *guard = CollectorState::Waiting {
-                finished_iteration_counter: outer_iteration_counter,
-            };
-            collector.status_condvar.notify_all();
-        }
-
+        /// It can be unparked in [`collector_update_now_and_wait`]
         thread::park_timeout(to_wait);
     }
 }

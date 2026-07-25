@@ -1,8 +1,8 @@
-use std::ops::Deref;
-use std::ptr::{null_mut, NonNull};
-use std::sync::atomic::{AtomicPtr, Ordering};
-use crate::atomic_sdarc::{borrow_from_atomic_ptr_using_hazard_pointer, load_atomic_ptr_owned, HazardPointerGuard, AtomicNullableSdarc};
+use crate::atomic_sdarc::{AtomicSdarcBorrowGuard, borrow_from_atomic_ptr, load_atomic_ptr_owned};
 use crate::sdarc::{Sdarc, SdarcInner, SdarcInnerPtrErased};
+use std::ops::Deref;
+use std::ptr::{NonNull, null_mut};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub(crate) struct WeakSdarcInner<T> {
     /// There is a circular reference. `SdarcInner` has `Sdarc<WeakSdarcInner>`, this references back.
@@ -139,8 +139,8 @@ impl<T: Send + Sync> WeakSdarc<T> {
     /// Unlike std `Weak`, the `WeakSdarc` can be borrowed without upgrading.
     /// The pointee is kept alive using hazard pointer and "debt paying" mechanism.
     #[allow(clippy::needless_lifetimes)]
-    pub fn borrow<'a>(&'a self) -> Option<HazardPointerGuard<'a, T>> {
+    pub fn borrow<'a>(&'a self) -> Option<AtomicSdarcBorrowGuard<'a, T>> {
         let weak_inner: &WeakSdarcInner<T> = self.sdarc_weak_inner.deref();
-        borrow_from_atomic_ptr_using_hazard_pointer(&weak_inner.back_ref)
+        borrow_from_atomic_ptr(&weak_inner.back_ref)
     }
 }

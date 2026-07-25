@@ -40,6 +40,7 @@ pub(crate) fn shard_count_from_env_var() -> Option<ShardCount> {
                         "Shard count specified by env var {ENV_SHARD_COUNT} is too large: {num}. The max is {MAX_SHARD_COUNT}"
                     );
                 } else {
+                    assert!(num > 0, "Shard count cannot be zero");
                     Some(ShardCount(num as u16))
                 }
             }

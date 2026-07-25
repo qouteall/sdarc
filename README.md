@@ -13,7 +13,7 @@ This library provides sharded-deferred-atomic-reference-counting (`Sdarc`). It c
 
 Different counter shards of one `Sdarc` are in different cache lines. But the different `Sdarc`'s counters in same shard can be put together. This saves memory. This library provides general sharded allocation functionality that allows allocating 8 bytes per shard. This library also supports sharded RwLock (reader acquire one sharded lock, writer acquire all locks, readers have low contention with each other).
 
-This library also provides atomic pointers `AtomicSdarc` and `AtomicNullableSdarc` (has functionality similar to `ArcSwap`). It uses lock-free synchronization with the collector to solve race condition.
+This library also provides atomic pointers `AtomicSdarc` and `AtomicNullableSdarc` (has functionality similar to `ArcSwap`). It uses hazard pointer and [asymmetric fence](https://crates.io/crates/membarrier2) to solve race condition.
 
 Its weak reference behavior is different to std `Arc`. Because that reclamation is deferred, upgrade from weak ref to strong ref can happen when strong counter sum is 0. The `Sdarc` can be "resurrected". After resurrection, the upgrading from weak ref to strong ref may fail or not fail.
 
@@ -21,11 +21,12 @@ Unlike `Arc` it doesn't support [`get_mut`](https://doc.rust-lang.org/std/sync/s
 
 This library doesn't suit these use ases:
 
-- If `Arc` atomic counter contention is low (there won't be many threads increment/decrement same counter in parallel), don't use this library.
-- If you want it to drop content immediately when strong reference count goes 0.
+- If `Arc` atomic counter contention is low (there won't be many threads increment/decrement same counter in parallel), don't use it.
+- If you want it to drop content immediately when strong reference count goes 0. (It frees layer-by-layer by default. A deep structure may take long time to be fully freed.)
 - For millions of small object, don't use `Sdarc`. It's recommended to put them into an arena. The arena can be held in `Sdarc`.
 - This library doesn't support no_std.
 
-Compare it with Linux percpu-refcount TODO
+Compare it with Linux percpu-refcount:
 
-TODO some init functions can be const
+- Linux percpu-refcount has two stages. In the first stage, increment/decrement use the per-CPU ref count slot. When the original owner drops reference, it switches to one atomic counter using RCU. In `Sdarc` there is no special owner.
+- Linux precpu-refcount uses non-atomic operation to increment/decrement per-CPU ref count. It relies on the fact that kernel code cannot be preempted. The user program can get CPU id via `sched_getcpu` but the thread could be scheduled to another CPU core right after calling it, so the user program has to use atomic operation.

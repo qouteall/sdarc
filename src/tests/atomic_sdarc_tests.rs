@@ -9,14 +9,14 @@ use crate::sdarc::Sdarc;
 #[test]
 fn test_atomic_nullable_new_is_none() {
     let atomic: AtomicNullableSdarc<i32> = AtomicNullableSdarc::new();
-    let loaded = atomic.load();
+    let loaded = atomic.load_owned();
     assert!(loaded.is_none());
 }
 
 #[test]
 fn test_atomic_nullable_new_with_value() {
     let atomic = AtomicNullableSdarc::new_with_value(42i32);
-    let loaded = atomic.load();
+    let loaded = atomic.load_owned();
     assert!(loaded.is_some());
     assert_eq!(*loaded.unwrap(), 42);
 }
@@ -25,7 +25,7 @@ fn test_atomic_nullable_new_with_value() {
 fn test_atomic_nullable_load_after_store() {
     let atomic = AtomicNullableSdarc::new();
     atomic.store(Some(Sdarc::new(100i32)));
-    let loaded = atomic.load();
+    let loaded = atomic.load_owned();
     assert!(loaded.is_some());
     assert_eq!(*loaded.unwrap(), 100);
 }
@@ -34,7 +34,7 @@ fn test_atomic_nullable_load_after_store() {
 fn test_atomic_nullable_store_none() {
     let atomic = AtomicNullableSdarc::new_with_value(42i32);
     atomic.store(None);
-    let loaded = atomic.load();
+    let loaded = atomic.load_owned();
     assert!(loaded.is_none());
 }
 
@@ -48,7 +48,7 @@ fn test_atomic_nullable_swap() {
     assert_eq!(*old.unwrap(), 10);
 
     // Current should be the new value
-    let current = atomic.load();
+    let current = atomic.load_owned();
     assert!(current.is_some());
     assert_eq!(*current.unwrap(), 20);
 }
@@ -60,7 +60,7 @@ fn test_atomic_nullable_swap_none_in() {
     assert!(old.is_some());
     assert_eq!(*old.unwrap(), 42);
 
-    let current = atomic.load();
+    let current = atomic.load_owned();
     assert!(current.is_none());
 }
 
@@ -70,7 +70,7 @@ fn test_atomic_nullable_swap_none_out() {
     let old = atomic.swap(Some(Sdarc::new(42i32)));
     assert!(old.is_none());
 
-    let current = atomic.load();
+    let current = atomic.load_owned();
     assert!(current.is_some());
     assert_eq!(*current.unwrap(), 42);
 }
@@ -79,7 +79,7 @@ fn test_atomic_nullable_swap_none_out() {
 fn test_atomic_nullable_compare_and_set_success() {
     let atomic = AtomicNullableSdarc::new_with_value(10i32);
 
-    let current = atomic.load();
+    let current = atomic.load_owned();
     let new_val = Some(Sdarc::new(20i32));
 
     let result = atomic.compare_and_set(&current, &new_val);
@@ -89,7 +89,7 @@ fn test_atomic_nullable_compare_and_set_success() {
     assert_eq!(*old.unwrap(), 10);
 
     // The pointer should now hold the new value
-    let loaded = atomic.load();
+    let loaded = atomic.load_owned();
     assert!(loaded.is_some());
     assert_eq!(*loaded.unwrap(), 20);
 }
@@ -106,7 +106,7 @@ fn test_atomic_nullable_compare_and_set_failure() {
     assert!(result.is_err());
 
     // The pointer should still hold the original value
-    let loaded = atomic.load();
+    let loaded = atomic.load_owned();
     assert!(loaded.is_some());
     assert_eq!(*loaded.unwrap(), 10);
 }
@@ -122,7 +122,7 @@ fn test_atomic_nullable_compare_and_set_none_to_some() {
     let old = result.unwrap();
     assert!(old.is_none());
 
-    let loaded = atomic.load();
+    let loaded = atomic.load_owned();
     assert!(loaded.is_some());
     assert_eq!(*loaded.unwrap(), 42);
 }
@@ -131,7 +131,7 @@ fn test_atomic_nullable_compare_and_set_none_to_some() {
 fn test_atomic_nullable_compare_and_set_some_to_none() {
     let atomic = AtomicNullableSdarc::new_with_value(10i32);
 
-    let if_matches = atomic.load();
+    let if_matches = atomic.load_owned();
     let then_set = None;
 
     let result = atomic.compare_and_set(&if_matches, &then_set);
@@ -140,7 +140,7 @@ fn test_atomic_nullable_compare_and_set_some_to_none() {
     assert!(old.is_some());
     assert_eq!(*old.unwrap(), 10);
 
-    let loaded = atomic.load();
+    let loaded = atomic.load_owned();
     assert!(loaded.is_none());
 }
 
@@ -148,9 +148,9 @@ fn test_atomic_nullable_compare_and_set_some_to_none() {
 fn test_atomic_nullable_multiple_loads() {
     let atomic = AtomicNullableSdarc::new_with_value(42i32);
 
-    let a = atomic.load();
-    let b = atomic.load();
-    let c = atomic.load();
+    let a = atomic.load_owned();
+    let b = atomic.load_owned();
+    let c = atomic.load_owned();
 
     assert!(a.is_some());
     assert!(b.is_some());
@@ -167,7 +167,7 @@ fn test_atomic_nullable_multiple_loads() {
 #[test]
 fn test_atomic_sdarc_new_and_load() {
     let atomic = AtomicSdarc::new(42i32);
-    let loaded = atomic.load();
+    let loaded = atomic.load_owned();
     assert_eq!(*loaded, 42);
 }
 
@@ -177,7 +177,7 @@ fn test_atomic_sdarc_swap() {
     let old = atomic.swap(Sdarc::new(20i32));
     assert_eq!(*old, 10);
 
-    let current = atomic.load();
+    let current = atomic.load_owned();
     assert_eq!(*current, 20);
 }
 
@@ -186,7 +186,7 @@ fn test_atomic_sdarc_store() {
     let atomic = AtomicSdarc::new(10i32);
     atomic.store(Sdarc::new(30i32));
 
-    let current = atomic.load();
+    let current = atomic.load_owned();
     assert_eq!(*current, 30);
 }
 
@@ -194,7 +194,7 @@ fn test_atomic_sdarc_store() {
 fn test_atomic_sdarc_compare_and_set_success() {
     let atomic = AtomicSdarc::new(10i32);
 
-    let if_matches = atomic.load();
+    let if_matches = atomic.load_owned();
     let then_set = Sdarc::new(20i32);
 
     let result = atomic.compare_and_set(&if_matches, &then_set);
@@ -202,7 +202,7 @@ fn test_atomic_sdarc_compare_and_set_success() {
     let old = result.unwrap();
     assert_eq!(*old, 10);
 
-    let current = atomic.load();
+    let current = atomic.load_owned();
     assert_eq!(*current, 20);
 }
 
@@ -216,7 +216,7 @@ fn test_atomic_sdarc_compare_and_set_failure() {
     let result = atomic.compare_and_set(&non_matching, &then_set);
     assert!(result.is_err());
 
-    let current = atomic.load();
+    let current = atomic.load_owned();
     assert_eq!(*current, 10);
 }
 
@@ -229,7 +229,7 @@ fn test_atomic_sdarc_multiple_swaps() {
         assert_eq!(*old, i - 1);
     }
 
-    assert_eq!(*atomic.load(), 9);
+    assert_eq!(*atomic.load_owned(), 9);
 }
 
 // ============================================================================
@@ -272,7 +272,7 @@ fn test_atomic_nullable_concurrent_loads() {
         let atomic_clone = Arc::clone(&atomic);
         handles.push(thread::spawn(move || {
             for _ in 0..100 {
-                let loaded = atomic_clone.load();
+                let loaded = atomic_clone.load_owned();
                 assert!(loaded.is_some());
                 assert_eq!(*loaded.unwrap(), 42);
             }
@@ -296,7 +296,7 @@ fn test_atomic_sdarc_concurrent_loads() {
         let atomic_clone = Arc::clone(&atomic);
         handles.push(thread::spawn(move || {
             for _ in 0..100 {
-                let loaded = atomic_clone.load();
+                let loaded = atomic_clone.load_owned();
                 assert_eq!(*loaded, 42);
             }
         }));

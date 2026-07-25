@@ -88,10 +88,6 @@ impl AtomicTaggedCounter {
     pub fn increment_ref_count_relaxed(&self) {
         self.0.fetch_add(2, Ordering::Relaxed);
     }
-    
-    pub fn increment_ref_count_seqcst(&self) {
-        self.0.fetch_add(2, Ordering::SeqCst);
-    }
 
     const MASK_FOR_CLEARING_TAG: i64 = !1;
 
@@ -126,11 +122,11 @@ impl AtomicTaggedCounter {
         // (handling counter overflow needs to "even out" counters and reduce lower bits if too large)
     }
 
-    pub fn fetch_and_clear_tag_relaxed(&self) -> TaggedCounter {
+    pub fn fetch_and_clear_tag_acquire(&self) -> TaggedCounter {
         // no need to use Release. decrementer use Release which won't sync with Release
         let v = self
             .0
-            .fetch_and(Self::MASK_FOR_CLEARING_TAG, Ordering::Relaxed);
+            .fetch_and(Self::MASK_FOR_CLEARING_TAG, Ordering::Acquire);
         TaggedCounter(v)
     }
 

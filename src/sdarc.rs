@@ -10,7 +10,6 @@ use std::ops::Deref;
 use std::hash::Hash;
 use std::ptr::{NonNull, null_mut};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use crate::weak_sdarc::{clear_weak_backref_impl, ClearWeakBackRefResult, WeakSdarcInner};
 
 /// Sharded deferred atomic reference counting.

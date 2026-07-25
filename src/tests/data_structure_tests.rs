@@ -168,7 +168,7 @@ fn doubly_linked_list_drops_correctly() {
         let mut curr = Some(head.clone());
         while let Some(node) = curr {
             count += 1;
-            curr = node.next.load();
+            curr = node.next.load_owned();
         }
         assert_eq!(count, n, "forward traversal wrong length");
 
@@ -349,20 +349,20 @@ fn binary_tree_with_parent_weak_drops_correctly() {
         let root = btp_build_perfect(depth, &counter).expect("root should exist");
 
         fn count(node: &BtpNode) -> usize {
-            1 + node.left.load().as_ref().map(|n| count(n)).unwrap_or(0)
-                + node.right.load().as_ref().map(|n| count(n)).unwrap_or(0)
+            1 + node.left.load_owned().as_ref().map(|n| count(n)).unwrap_or(0)
+                + node.right.load_owned().as_ref().map(|n| count(n)).unwrap_or(0)
         }
         assert_eq!(count(&root), (1 << depth) - 1);
 
         // Verify parent weak refs work while tree is alive.
         // root's immediate children:
-        if let Some(left) = root.left.load() {
+        if let Some(left) = root.left.load_owned() {
             let parent_upgrade = left.parent.as_ref().and_then(|w| w.upgrade());
             assert!(parent_upgrade.is_some());
             let a = &parent_upgrade.unwrap();
             assert!(Sdarc::<BtpNode>::ptr_eq(a, &root));
         }
-        if let Some(right) = root.right.load() {
+        if let Some(right) = root.right.load_owned() {
             let parent_upgrade = right.parent.as_ref().and_then(|w| w.upgrade());
             assert!(parent_upgrade.is_some());
             let a = &parent_upgrade.unwrap();
@@ -374,7 +374,7 @@ fn binary_tree_with_parent_weak_drops_correctly() {
         let mut curr = root.clone();
         let mut depth_walked = 0;
         loop {
-            let left = curr.left.load();
+            let left = curr.left.load_owned();
             if left.is_none() {
                 break;
             }

@@ -1,36 +1,32 @@
 //! Atomic Sdarc pointers.
 //!
+//! Note that it uses the asymmetric fence https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p1202r4.pdf
+//! via membarrier2 crate. The heavy fence uses OS API that sends interrupt to every core executing current process's
+//! thread. The light fence is just compiler fence. The light fence can sync with heavy fence similar to SeqCst.
+//! However, light fence don't sync between. And light fence don't sync with normal SeqCst.
+//! The asymmetric fence is not yet included in C++ memory model (that Rust uses).
+//!
 //! The safety relies on:
 //! - The collector takes two iterations observing zero ref count sum to free one object.
-//! - The collector will run a `membarrier2::heavy()` before each iteration.
-//! -
+//! - The collector will run a `membarrier2::heavy()` before each iteration, then read hazard pointers,
+//!   and spin until observing reader critical section in inactive state once.
+//! - The atomic writer uses SeqCst which syncs with collector heavy barrier.
 //!
-//! The hazard pointer mechanism
-//!
-//! A hazard pointer being not null means that
-//! the thread is borrowing on the Sdarc content but didn't increment reference count.
-//! A non-dangling hazard pointer means "reference count debt".
-//! The thread should increment reference count, but haven't.
-//!
-//! When collector is about to free one `SdarcInner` it scans all hazard pointers (read-only for collector).
-//! If there is corresponding hazard pointer, collector won't free it in current iteration.
+//! Hazard pointer prevents collector from collecting it. It's a way to keep pointee alive even
+//! when reference count sum is 0.
 //!
 //! When current thread's hazard pointer slots are full,
-//! it will pay reference count debt by incrementing reference count.
-//! Then when borrowing stops, it should decrement reference count to compensate.
+//! it will fallback to reader critical section.
 
-use crate::sdarc::{Sdarc, SdarcInner, SdarcInnerFatPtr, SdarcInnerPtrErased, SdarcVTable};
+use crate::sdarc::{Sdarc, SdarcInner, SdarcInnerPtrErased};
 use append_only_vec::AppendOnlyVec;
-use crossbeam::channel::at;
-use crossbeam::utils::CachePadded;
-use parking_lot::Mutex;
+use crossbeam_utils::CachePadded;
 use rustc_hash::FxHashSet;
-use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, Not};
 use std::ptr::{NonNull, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering, compiler_fence};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::{array, hint};
 
 pub struct AtomicNullableSdarc<T> {
@@ -41,7 +37,7 @@ unsafe impl<T: Send> Send for AtomicNullableSdarc<T> {}
 unsafe impl<T: Sync> Sync for AtomicNullableSdarc<T> {}
 
 impl<T: Send + Sync> AtomicNullableSdarc<T> {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             inner_ptr: AtomicPtr::new(null_mut()),
         }
@@ -55,7 +51,11 @@ impl<T: Send + Sync> AtomicNullableSdarc<T> {
 }
 
 impl<T> AtomicNullableSdarc<T> {
-    pub fn load(&self) -> Option<Sdarc<T>> {
+    /// Load the atomic pointer as owned. Gives owned `Sdarc<T>` if not null. Gives None if null.
+    ///
+    /// If you just want to do short-term read, it's recommended to use [`AtomicNullableSdarc::borrow`] which
+    /// can be faster (it uses hazard pointer, requiring no atomic read-modify-write operation in happy path).
+    pub fn load_owned(&self) -> Option<Sdarc<T>> {
         load_atomic_ptr_owned(&self.inner_ptr)
     }
 
@@ -63,8 +63,6 @@ impl<T> AtomicNullableSdarc<T> {
     pub fn swap(&self, sdarc: Option<Sdarc<T>>) -> Option<Sdarc<T>> {
         let new_ptr = Sdarc::nullable_into_raw_ptr(sdarc);
 
-        // Use SeqCst to sync with collector's heavy barrier
-        // (actually light barrier is also or AcqRel can also sync with heavy barrier, use SeqCst because API user may need it)
         let old_ptr = self.inner_ptr.swap(new_ptr, Ordering::SeqCst);
 
         unsafe { Sdarc::nullable_from_raw_ptr(old_ptr) }
@@ -98,8 +96,6 @@ impl<T> AtomicNullableSdarc<T> {
         let r = self.inner_ptr.compare_exchange(
             if_matches_ptr,
             then_set_ptr,
-            // Use SeqCst to sync with collector's heavy barrier
-            // (actually light barrier is also or AcqRel can also sync with heavy barrier, use SeqCst because API user may need it)
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
@@ -133,8 +129,21 @@ impl<T> AtomicNullableSdarc<T> {
     ///
     /// It returns None if the loaded pointer is null.
     #[allow(clippy::needless_lifetimes)]
-    pub fn borrow<'a>(&'a self) -> Option<HazardPointerGuard<'a, T>> {
-        borrow_from_atomic_ptr_using_hazard_pointer(&self.inner_ptr)
+    pub fn borrow<'a>(&'a self) -> Option<AtomicSdarcBorrowGuard<'a, T>> {
+        borrow_from_atomic_ptr(&self.inner_ptr)
+    }
+
+    /// The `borrow` is fast enough for reader. But if you want blazing-fast read,
+    /// you can keep a local (per-thread) `Sdarc<T>`, then periodically sync the atomic pointer to local `Sdarc<T>`.
+    /// If the atomic pointer doesn't change, the sync involves almost no cost.
+    ///
+    /// This is similar to arcshift.
+    pub fn sync_to(&self, target: &mut Option<Sdarc<T>>) {
+        let targe_curr_ptr = Sdarc::nullable_get_raw_ptr(target);
+        let curr_atomic_ptr = self.inner_ptr.load(Ordering::Relaxed);
+        if targe_curr_ptr != curr_atomic_ptr {
+            *target = self.load_owned();
+        }
     }
 }
 
@@ -152,8 +161,11 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     }
 
     /// Load the atomic pointer and give owned `Sdarc<T>`.
-    pub fn load(&self) -> Sdarc<T> {
-        self.0.load().unwrap()
+    ///
+    /// If you just want to do short-term read, it's recommended to use [`AtomicSdarc::borrow`] which
+    /// can be faster (it uses hazard pointer, requiring no atomic read-modify-write operation in happy path).
+    pub fn load_owned(&self) -> Sdarc<T> {
+        self.0.load_owned().unwrap()
     }
 
     /// Set the atomic pointer and get the replaced one.
@@ -184,8 +196,21 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     }
 
     #[allow(clippy::needless_lifetimes)]
-    pub fn borrow<'a>(&'a self) -> HazardPointerGuard<'a, T> {
+    pub fn borrow<'a>(&'a self) -> AtomicSdarcBorrowGuard<'a, T> {
         self.0.borrow().unwrap()
+    }
+
+    /// The `borrow` is fast enough for reader. But if you want blazing-fast read,
+    /// you can keep a local (per-thread) `Sdarc<T>`, then periodically sync the atomic pointer to local `Sdarc<T>`.
+    /// If the atomic pointer doesn't change, the sync involves almost no cost.
+    ///
+    /// This is similar to arcshift.
+    pub fn sync_to(&self, target: &mut Sdarc<T>) {
+        let targe_curr_ptr = target.inner_ptr.as_ptr();
+        let curr_atomic_ptr = self.0.inner_ptr.load(Ordering::Relaxed);
+        if targe_curr_ptr != curr_atomic_ptr {
+            *target = self.load_owned();
+        }
     }
 }
 
@@ -206,40 +231,48 @@ struct HzSlotIndex(u8);
 ///
 /// It can also be seen as a "universal" hazard pointer that correspond to any data managed by Sdarc.
 ///
-/// It must be used in SeqCst ordering. Collector reading it using Acquire ordering is not safe,
-/// because Acquire pure load can load stale values. The Release-Acquire ordering only gives guarantee
-/// when Acquire reader reads new value. It has no guarantee when Acquire reads old value.
-///
-/// The atomic pointer must also be accessed with SeqCst.
-///
 /// Reader thread:
-/// 1. set is_loading_atomic_sdarc_as_owned to true
+/// 1. set critical section flag to true, Relaxed
 /// 2. light barrier
 /// 3. load atomic pointer
 /// (Assume that Reader thread can be un-scheduled here)
 /// 4. increment ref count
-/// 5. light barrier
-/// 6. set is_loading_atomic_sdarc_as_owned to false
+/// 5. set critical section flag to false, Release
 ///
 /// Writer thread:
-/// 1. swap atomic pointer
+/// 1. swap atomic pointer, SeqCst
 /// 2. decrement ref count of original object, Release
 ///
 /// Collector thread:
 /// 1. heavy barrier
-/// 2. for each thread's is_loading_atomic_sdarc_as_owned in SeqCst, poll until observing false
+/// 2. for each thread's critical section flag, poll using Acquire until observing false
 /// 3. read counter sum in Acquire ordering. if it stays 0, clear tags
 /// 4. in next collector inner iteration, heavy barrier again, poll until observing false again
 /// 5. read counter sum in Acquire ordering, if it stays 0 and no tag is observed, free the memory
 ///
-/// Right after collector finishing polling, a reader thread can start reading. This is fine
-/// because it takes at least two inner iterations to free one object.
+/// Normally if reader is unscheduled between 3 and 4, collector will be polling, until reader exits critical section.
 ///
-/// Note: the SeqCst ordering is required (when light barrier synchronizes with heavy barrier it provides SeqCst ordering).
-/// Using only Release-Acquire ordering is unsound.
-/// Then it's possible that Reader's setting is_loading_atomic_sdarc_as_owned to true is not visible to collector
-/// for long time, and reader is un-scheduled for long time between 2 and 3, then collector frees the object
-/// whose pointer was the load result of reader.
+/// Is it safe when right after collector finishes polling reader sets flag to true? Yes because it requires two
+/// collector iterations to free one object.
+///
+/// But the light barrier doesn't sync wtih writer's SeqCst write. Is it still safe when reader reads a stale pointer?
+///
+/// Consider this extreme case:
+///
+/// - Writer swaps pointer and decrement reference count.
+/// - Collector does first iteration, observe reference count sum is 0, clear tags
+/// - Collector runs second iteration, and reader starts reading in parallel
+///
+/// The collector's second iteration's heavy barrier CH has a total order with reader's light barrier RL.
+/// There are two cases:
+/// - RL is before CH. Then reader's setting of critical section flag will be observable to collector.
+///   When collector observes flag being false, the Acquire-Release ordering make collector be able
+///   to observe incremented ref count. Even if reader reads a stale pointer, collector can observe the
+///   incremented ref count so it's safe.
+/// - CH is before RL. Consider that in previous iteration collector has observed zero ref count sum using Acquire,
+///   and writer's decrementing of ref count uses Release, and writer's swapping of pointer is before decrementing ref
+///   count, so the swapped pointer was observable to collector. Now RL is after CH, so the swapped pointer should also
+///   be observable to reader. Reader won't read the stale pointer that is about to be freed.
 pub(crate) struct PerThreadReaderCriticalSection(AtomicBool);
 
 impl PerThreadReaderCriticalSection {
@@ -258,9 +291,7 @@ impl PerThreadReaderCriticalSection {
         membarrier2::light();
 
         let _guard = scopeguard::guard((), |()| {
-            membarrier2::light();
-
-            self.0.store(false, Ordering::Relaxed);
+            self.0.store(false, Ordering::Release);
         });
 
         let result = func();
@@ -268,19 +299,16 @@ impl PerThreadReaderCriticalSection {
         result
     }
 
-    fn direct_poll(&self) -> bool {
+    fn get_relaxed(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
 
     fn collector_poll_until_false(&self) {
         loop {
-            let r = self.0.load(Ordering::Relaxed);
+            let r = self.0.load(Ordering::Acquire);
             if r.not() {
                 return;
             }
-
-            // this is just for preventing compiler from merging reads
-            compiler_fence(Ordering::SeqCst);
 
             hint::spin_loop();
         }
@@ -302,36 +330,33 @@ impl PerThreadSharedHazardData {
         self.hazard_ptr_slots[index.0 as usize].load(Ordering::Relaxed)
     }
 
+    fn load_acquire(&self, index: HzSlotIndex) -> *mut u8 {
+        self.hazard_ptr_slots[index.0 as usize].load(Ordering::Acquire)
+    }
+
     fn store_relaxed(&self, index: HzSlotIndex, ptr: *mut u8) {
         self.hazard_ptr_slots[index.0 as usize].store(ptr, Ordering::Relaxed)
+    }
+
+    fn store_release(&self, index: HzSlotIndex, ptr: *mut u8) {
+        self.hazard_ptr_slots[index.0 as usize].store(ptr, Ordering::Release)
     }
 }
 
 impl HzSlotIndex {
-    fn offset(self, i: usize) -> HzSlotIndex {
-        assert!(self.0 < HZ_PTR_SLOT_COUNT as u8);
-        assert!(i < HZ_PTR_SLOT_COUNT);
-
-        let num = (self.0 as usize) + i;
-        HzSlotIndex((num % HZ_PTR_SLOT_COUNT) as u8)
-    }
-
     fn all() -> impl Iterator<Item = HzSlotIndex> {
         (0..HZ_PTR_SLOT_COUNT).map(|n| HzSlotIndex(n as u8))
     }
-
-    fn all_start_from(start_index: HzSlotIndex) -> impl Iterator<Item = HzSlotIndex> {
-        (0..HZ_PTR_SLOT_COUNT).map(move |n| start_index.offset(n))
-    }
 }
 
-// The AppendOnlyVec is simpler than manually making a lock-free linked list
+// The AppendOnlyVec is simpler than manually making a lock-free linked list.
+// It's append-only, no freeing, avoid race condition of freeing it.
+// Its size is as large as the max amount of threads that use atomic sdarc at the same time.
 static SHARED_HAZARD_DATA: AppendOnlyVec<CachePadded<PerThreadSharedHazardData>> =
     AppendOnlyVec::new();
 
 fn obtain_per_thread_shared_hazard_data() -> &'static PerThreadSharedHazardData {
     for e in SHARED_HAZARD_DATA.iter() {
-        /// Why use Acquire: make is_used being true visible before subsequent hazard pointer operations
         let old_is_used = e.is_used.swap(true, Ordering::Acquire);
         if !old_is_used {
             // claimed by current thread
@@ -340,7 +365,7 @@ fn obtain_per_thread_shared_hazard_data() -> &'static PerThreadSharedHazardData 
     }
 
     let r = PerThreadSharedHazardData {
-        hazard_ptr_slots: array::from_fn(|_| (AtomicPtr::new(null_mut()))),
+        hazard_ptr_slots: array::from_fn(|_| AtomicPtr::new(null_mut())),
         is_used: AtomicBool::new(true),
         reader_critical_section: PerThreadReaderCriticalSection::new(),
     };
@@ -356,7 +381,7 @@ fn release_hazard_data(r: &'static PerThreadSharedHazardData) {
             .iter()
             .all(|ptr| ptr.load(Ordering::Relaxed).is_null())
     );
-    assert!(r.reader_critical_section.direct_poll().not());
+    assert!(r.reader_critical_section.get_relaxed().not());
 
     let old_used = r.is_used.swap(false, Ordering::Release);
     assert!(old_used);
@@ -402,7 +427,7 @@ pub(crate) fn traverse_atomic_reader_signals() -> HazardPointerSet {
 
     traverse_all_hazard_datum(|data| {
         for index in HzSlotIndex::all() {
-            let ptr = data.load_relaxed(index);
+            let ptr = data.load_acquire(index);
             if let Some(ptr) = NonNull::new(ptr) {
                 hazard_ptr_set.insert(ptr);
             }
@@ -416,38 +441,9 @@ pub(crate) fn traverse_atomic_reader_signals() -> HazardPointerSet {
     HazardPointerSet(hazard_ptr_set)
 }
 
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum HazardSlotStatus {
-    Unused,
-    UsedMaybeDangling,
-    UsedNotDangling(SdarcInnerFatPtr),
-}
-
-/// Purely accessed by local thread. Not shared.
-struct LocalOnlyHazardStatus {
-    slot_statuses: [Cell<HazardSlotStatus>; HZ_PTR_SLOT_COUNT],
-    index_to_start_check: Cell<HzSlotIndex>,
-}
-
-impl LocalOnlyHazardStatus {
-    fn get_status(&self, index: HzSlotIndex) -> HazardSlotStatus {
-        self.slot_statuses[index.0 as usize].get()
-    }
-
-    fn set_status(&self, index: HzSlotIndex, status: HazardSlotStatus) {
-        self.slot_statuses[index.0 as usize].set(status)
-    }
-}
-
-thread_local! {
-    static LOCAL_ONLY_HAZARD_STATUS: LocalOnlyHazardStatus =
-        LocalOnlyHazardStatus{
-            slot_statuses: std::array::from_fn(|_| Cell::new(HazardSlotStatus::Unused)),
-            index_to_start_check: Cell::new(HzSlotIndex(0))
-        };
-}
-
-pub struct HazardPointerGuard<'a, T> {
+/// This guard should be held in local variable. It should not be owned by thread local.
+/// Because its dropping uses other thread locals.
+pub(crate) struct HazardPointerGuard<'a, T> {
     hazard_slot_index: HzSlotIndex,
     loaded_ptr: ManuallyDrop<Sdarc<T>>,
     // limit the lifetime of guard object
@@ -473,85 +469,149 @@ impl<'a, T> Deref for HazardPointerGuard<'a, T> {
     }
 }
 
-#[allow(clippy::needless_lifetimes)]
-pub(crate) fn borrow_from_atomic_ptr_using_hazard_pointer<'a, T>(
-    atomic_ptr: &'a AtomicPtr<SdarcInner<T>>,
-) -> Option<HazardPointerGuard<'a, T>> {
-    // Use Relaxed load because it's just a pre-read.
-    // The publishing of hazard pointer use AckRel, and hazard pointer has data dependency to it,
-    // so it cannot be moved to after publishing hazard pointer.
-    let mut pre_loaded_ptr = atomic_ptr.load(Ordering::Relaxed);
+/// This guard should be held in local variable. It should not be owned by thread local.
+/// Because its dropping may use other thread locals.
+pub struct AtomicSdarcBorrowGuard<'a, T>(AtomicSdarcBorrowGuardInner<'a, T>);
 
-    loop {
-        let pre_loaded_ptr_nn = match NonNull::new(pre_loaded_ptr) {
-            None => {
-                // If it's null, directly finish, no need to touch hazard pointer
-                return None;
-            }
-            Some(p) => p,
-        };
+// use a separate type because Rust doesn't allow public enum to have private variant
+pub(crate) enum AtomicSdarcBorrowGuardInner<'a, T> {
+    UsingHazardPtr(HazardPointerGuard<'a, T>),
+    Owned(Sdarc<T>),
+}
 
-        // after the pre-loading, current thread may be un-scheduled,
-        // then atomic pointer can change and the original SdarcInner may be freed.
-        // at this time, the pre_loaded_ptr may be dangling.
+impl<'a, T> Deref for AtomicSdarcBorrowGuard<'a, T> {
+    type Target = T;
 
-        // publish the maybe-dangling ptr as hazard pointer.
-        // the collector will only compare hazard pointers with non-dangling pointers.
-        // the collector will never dereference hazard pointer.
-        // (it's possible that the dangling pointer coincidentally equals a living SdarcInner pointer with another type,
-        // it's fine because it will just delay collection. this is temporary and won't cause long-term leak.)
-        let hazard_slot_index = publish_maybe_dangling_hazard_pointer(pre_loaded_ptr_nn);
-
-        // This light barrier has SeqCst ordering between collector's heavy barrier.
-        // If the heavy barrier is ordered after this, collector can observe hazard pointer.
-        // If the heavy barrier is ordered before this, there are two cases:
-        // - atomic ptr writer's SeqCst write is before collector heavy barrier, then the re-load can observe the new pointer
-        // - atomic ptr writer's SeqCst write is after collector heavy barrier.
-        //   in that case the reader and writer has direct no ordering because light barrier doesn't sync with SeqCst.
-        //   the reader and writer can only have indirect ordering via collector.
-        //   the reader re-load can load stale pointer, which points to SdarcInner whose ref count sum is 0.
-        //   but it's still safe because collector requires two iterations to free.
-        //   the next collector iteration's heavy barrier will be likely after this light barrier, so collector can
-        //   observe the hazard pointer if borrowing hasn't finished.
-        //   however there is a rare case where collector's next iteration's heavy barrier is still before this light barrier, but after the writer SeqCst write.
-        //   in that case, we need to consider that collector reads reference count using Acquire, and decrementing ref
-        //   count uses Release. swapping atomic pointer is SeqCst, but when SeqCst is used with acquire-release,
-        //   SeqCst is only as strong as acquire-release. but that's enough for safety.
-        //   if collector observes zero ref count sum, according to acquire-release, the swapped atomic pointer
-        //   should also be visible to collector (although collector doesn't load atomic pointer normally),
-        //   then in the next iteration's beginning's heavy barrier, the precondition says it's before this light
-        //   fence. the heavy barrier synchronizes-with this light fence, even just consider Release-Acquire ordering,
-        //   the reader thread can then observe new atomic pointer.
-        membarrier2::light();
-
-        let re_loaded_ptr = atomic_ptr.load(Ordering::Relaxed);
-
-        // if pointer equals, everything is fine. pointer is not dangling. borrow succeeded.
-        // it's possible that object pointed by pre_loaded_ptr was freed, then another object is allocated in same address coincidentally.
-        // it's fine because the type system ensures type is same. we just borrow the new object.
-        // (in that case, the re_loaded_ptr has different provenance to pre_loaded_ptr, so it uses re_loaded_ptr)
-        if re_loaded_ptr == pre_loaded_ptr {
-            let re_loaded_ptr = NonNull::new(re_loaded_ptr).unwrap();
-            mark_hazard_pointer_non_dangling(hazard_slot_index, re_loaded_ptr);
-            return Some(HazardPointerGuard {
-                hazard_slot_index,
-                loaded_ptr: ManuallyDrop::new(unsafe { Sdarc::from_raw_ptr(re_loaded_ptr) }),
-                _limit_lifetime: PhantomData,
-                _no_send_sync: PhantomData,
-            });
-        } else {
-            // The atomic ptr changed. the pointer may be dangling. un-publish hazard pointer.
-            // in normal hazard pointer implementation, it will retry, but in this library
-            // it will use reader critical section to load owned Sdarc.
-            // The reader critical section is slower than hazard pointer. Reader critical section
-            // takes 3 atomic RMW(read-modify-write) ops to load (two for critical section counter,
-            // 1 for reference count increment). Hazard pointer takes only 1 RMW to start borrowing if succeeded.
-            // But hazard pointer borrowing may fail. If it retries on fail, then it may take
-
-            unpublish_hazard_pointer_on_load_failed(hazard_slot_index);
-            pre_loaded_ptr = re_loaded_ptr;
-            continue;
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            AtomicSdarcBorrowGuardInner::UsingHazardPtr(g) => g.deref(),
+            AtomicSdarcBorrowGuardInner::Owned(sdarc) => sdarc.deref(),
         }
+    }
+}
+
+#[allow(clippy::needless_lifetimes)]
+pub(crate) fn borrow_from_atomic_ptr<'a, T>(
+    atomic_ptr: &'a AtomicPtr<SdarcInner<T>>,
+) -> Option<AtomicSdarcBorrowGuard<'a, T>> {
+    match try_borrow_from_atomic_ptr_using_hazard_pointer(atomic_ptr) {
+        Ok(g) => match g {
+            None => None,
+            Some(g) => Some(AtomicSdarcBorrowGuard(
+                AtomicSdarcBorrowGuardInner::UsingHazardPtr(g),
+            )),
+        },
+        Err(_) => {
+            let sdarc_opt = load_atomic_ptr_owned(atomic_ptr);
+            match sdarc_opt {
+                None => None,
+                Some(sdarc) => Some(AtomicSdarcBorrowGuard(AtomicSdarcBorrowGuardInner::Owned(
+                    sdarc,
+                ))),
+            }
+        }
+    }
+}
+
+pub(crate) enum HazardBorrowErr {
+    SlotFull,
+    PointerChanged,
+}
+
+/// Borrow content from an atomic sdarc using hazard pointer, without incrementing ref count.
+/// It uses asymmetric fence to make reader fast.
+///
+/// Reader:
+/// 1. load atomic ptr, Relaxed
+/// (reader can be un-scheduled here)
+/// 2. publish hazard pointer, Relaxed
+/// 3. light fence
+/// 4. re-load atomic ptr, Relaxed
+/// 5. if two pointers equal, borrowing succeeded
+///
+/// Writer:
+/// 1. swap atomic ptr, SeqCst
+/// 2. decrement ref count of original object, Release
+///
+/// Collector:
+/// 1. in beginning of first iteration, heavy barrier
+/// 2. read hazard pointers, Relaxed
+/// 3. for a non-hazard `SdarcInner`, read reference count, if observe zero sum, clear tags, read ref count using Acquire
+/// 4. in beginning of second iteration, heavy barrier
+/// 5. read hazard pointers, Relaxed
+/// 6. re-check ref count for non-hazard `SdarcInner`s
+///
+/// Is it still safe when reader publishes hazard pointer right after collector finish checking hazard pointers?
+/// Yes because it requires two collector iterations to free one object.
+///
+/// Reader light barrier doesn't sync with writer SeqCst write. Is it still safe when reader reads stale pointer?
+/// Consider this extreme case:
+///
+/// - Writer swap atomic pointer and decrement ref count of original object.
+/// - Collector finishes first iteration, observed original object's zero ref count sum.
+/// - Reader loads stale pointer. The collector second iteration runs in parallel.
+///
+/// The reader's light fence Rl has total order with collector's second iteration heavy barrier CH.
+/// There are two cases:
+/// - RL is before CH. Then the published stale hazard pointer is visible to collector. Collector won't free
+///   original object in second iteration. Safe.
+/// - CH is before RL. When collector observes zero ref count sum in first iteration using Acquire ordering,
+///   the changed atomic pointer should be visible to collector. The RL being after CH makes the changed atomic
+///   pointer visible to reader. Then re-read reads a different pointer, hazard pointer borrow failed. Safe.
+#[allow(clippy::needless_lifetimes)]
+pub(crate) fn try_borrow_from_atomic_ptr_using_hazard_pointer<'a, T>(
+    atomic_ptr: &'a AtomicPtr<SdarcInner<T>>,
+) -> Result<Option<HazardPointerGuard<'a, T>>, HazardBorrowErr> {
+    let pre_loaded_ptr = atomic_ptr.load(Ordering::Relaxed);
+
+    let pre_loaded_ptr_nn = match NonNull::new(pre_loaded_ptr) {
+        None => {
+            // If it's null, directly finish, no need to touch hazard pointer
+            return Ok(None);
+        }
+        Some(p) => p,
+    };
+
+    // after the pre-loading, current thread may be un-scheduled,
+    // then atomic pointer can change and the original SdarcInner may be freed.
+    // at this time, the pre_loaded_ptr may be dangling.
+
+    // publish the maybe-dangling ptr as hazard pointer.
+    // the collector will only compare hazard pointers with non-dangling pointers.
+    // the collector will never dereference hazard pointer.
+    // (it's possible that the dangling pointer coincidentally equals a living SdarcInner pointer with another type,
+    // it's fine because it will just delay collection. this is temporary and won't cause long-term leak.)
+    let hazard_slot_index_opt = try_publish_maybe_dangling_hazard_pointer(pre_loaded_ptr_nn);
+
+    let Some(hazard_slot_index) = hazard_slot_index_opt else {
+        return Err(HazardBorrowErr::SlotFull);
+    };
+
+    // About safety, see function doc.
+    membarrier2::light();
+
+    // Why Acquire (instead of Relaxed): avoid reading uninitialized data from new pointer
+    let re_loaded_ptr = atomic_ptr.load(Ordering::Acquire);
+
+    // if pointer equals, everything is fine. pointer is not dangling. borrow succeeded.
+    // it's possible that object pointed by pre_loaded_ptr was freed, then another object is allocated in same address coincidentally.
+    // it's fine because the type system ensures type is same. we just borrow the new object.
+    // (in that case, the re_loaded_ptr has different provenance to pre_loaded_ptr, so it uses re_loaded_ptr)
+    if re_loaded_ptr == pre_loaded_ptr {
+        let re_loaded_ptr = NonNull::new(re_loaded_ptr).unwrap();
+        return Ok(Some(HazardPointerGuard {
+            hazard_slot_index,
+            loaded_ptr: ManuallyDrop::new(unsafe { Sdarc::from_raw_ptr(re_loaded_ptr) }),
+            _limit_lifetime: PhantomData,
+            _no_send_sync: PhantomData,
+        }));
+    } else {
+        // this should be very rare.
+        // even if the atomic ptr is changing frequently,
+        // the pre-load and re-load uses relaxed load which likely comes from cache.
+        let shared = curr_thread_shared_hazard_data();
+        shared.store_relaxed(hazard_slot_index, null_mut());
+        return Err(HazardBorrowErr::PointerChanged);
     }
 }
 
@@ -566,132 +626,40 @@ pub(crate) fn borrow_from_atomic_ptr_using_hazard_pointer<'a, T>(
 // In the next collector iteration it re-reads hazard pointers. If borrow still hasn't finished,
 // collector won't free the SdarcInner.
 
-fn publish_maybe_dangling_hazard_pointer<T>(ptr: NonNull<SdarcInner<T>>) -> HzSlotIndex {
+fn try_publish_maybe_dangling_hazard_pointer<T>(
+    ptr: NonNull<SdarcInner<T>>,
+) -> Option<HzSlotIndex> {
     let shared = curr_thread_shared_hazard_data();
 
-    LOCAL_ONLY_HAZARD_STATUS.with(|local| {
-        let start_index = local.index_to_start_check.get();
-
-        for index in HzSlotIndex::all_start_from(start_index) {
-            match local.get_status(index) {
-                HazardSlotStatus::Unused => {
-                    local.index_to_start_check.set(index.offset(1));
-                    shared.store_relaxed(index, ptr.as_ptr() as *mut u8);
-                    local.set_status(index, HazardSlotStatus::UsedMaybeDangling);
-                    return (index);
-                }
-                HazardSlotStatus::UsedMaybeDangling => {
-                    panic!(
-                        "Should not meet UsedMaybeDangling state in publish_hazard_pointer_seqcst"
-                    )
-                }
-                HazardSlotStatus::UsedNotDangling(_) => {
-                    // slot used, see other slots
-                    continue;
-                }
-            }
+    // linear scan, should be fast
+    for index in HzSlotIndex::all() {
+        let loaded_ptr = shared.load_relaxed(index);
+        if loaded_ptr.is_null() {
+            shared.store_relaxed(index, ptr.as_ptr() as *mut u8);
+            return Some(index);
         }
+    }
 
-        let first_index = HzSlotIndex(0);
-
-        let old_status_at_first_slot = local.get_status(first_index);
-        let fat_ptr = match old_status_at_first_slot {
-            HazardSlotStatus::UsedNotDangling(fat_ptr) => fat_ptr,
-            _ => {
-                panic!("Not expecting state {old_status_at_first_slot:?}");
-            }
-        };
-        unsafe {
-            fat_ptr
-                .get_counters_ptr()
-                .ptr_at_curr_thread_shard()
-                .as_ref()
-                .increment_ref_count_relaxed()
-        };
-
-        // If collector observes old hazard pointer being replaced,
-        // collector must observe incremented reference count later.
-        // Collector reads hazard pointers before reading reference counts.
-        membarrier2::light();
-
-        shared.store_relaxed(first_index, ptr.as_ptr() as *mut u8);
-        local.set_status(first_index, HazardSlotStatus::UsedMaybeDangling);
-
-        first_index
-    })
-}
-
-fn unpublish_hazard_pointer_on_load_failed(index: HzSlotIndex) {
-    let shared = curr_thread_shared_hazard_data();
-    LOCAL_ONLY_HAZARD_STATUS.with(|local| {
-        let status = local.get_status(index);
-        assert!(matches!(
-            status,
-            HazardSlotStatus::UsedMaybeDangling | HazardSlotStatus::UsedNotDangling(_)
-        ));
-        shared.store_relaxed(index, null_mut());
-        local.set_status(index, HazardSlotStatus::Unused);
-    });
+    return None;
 }
 
 fn unpublish_hazard_pointer_on_borrow_finish<T>(
     index: HzSlotIndex,
-    borrowed_ptr: NonNull<SdarcInner<T>>,
+    _borrowed_ptr: NonNull<SdarcInner<T>>,
 ) {
     let shared = curr_thread_shared_hazard_data();
-    LOCAL_ONLY_HAZARD_STATUS.with(|local| {
-        let status = local.get_status(index);
-        // The "debt" means it obtains a borrow but doesn't increment reference count.
-        // (If it's cloned into an owned Sdarc, then borrowing the owned Sdarc involves no
-        // reference count debt because reference count increased.)
-        // The debt can be payed by incrementing reference count.
-        // If the debt was payed, it should compensate by decrementing reference count when borrow finishes.
-        // If the debt was never payed, we just clear the hazard pointer when borrow finishes, and the debt just vanishes.
-        let was_ref_count_debt_payed = match status {
-            HazardSlotStatus::Unused => {
-                true
-            }
-            HazardSlotStatus::UsedMaybeDangling => {
-                panic!("Not expecting UsedMaybeDangling in unpublish_hazard_pointer_on_borrow_finish_acqrel")
-            }
-            HazardSlotStatus::UsedNotDangling(fat_ptr) => {
-                if fat_ptr.ptr == SdarcInnerPtrErased::from_typed(borrowed_ptr) {
-                    false
-                } else {
-                    true
-                }
-            }
-        };
-        if !was_ref_count_debt_payed {
-            unsafe { borrowed_ptr.as_ref() }
-                .counters.at_curr_thread_shard().decrement_ref_count_and_set_tag_release();
-        } else {
-             shared.store_relaxed(index, null_mut());
-        }
-    })
-}
 
-fn mark_hazard_pointer_non_dangling<T>(
-    index: HzSlotIndex,
-    sdarc_inner_ptr: NonNull<SdarcInner<T>>,
-) {
-    LOCAL_ONLY_HAZARD_STATUS.with(|local| {
-        let old_status = local.get_status(index);
-        assert!(matches!(old_status, HazardSlotStatus::UsedMaybeDangling));
-        local.set_status(
-            index,
-            HazardSlotStatus::UsedNotDangling(SdarcInnerFatPtr::new(sdarc_inner_ptr)),
-        )
-    });
+    debug_assert!(shared.load_relaxed(index) != null_mut());
+
+    shared.store_release(index, null_mut());
 }
 
 pub(crate) fn load_atomic_ptr_owned<T>(atomic_ptr: &AtomicPtr<SdarcInner<T>>) -> Option<Sdarc<T>> {
     let shared = curr_thread_shared_hazard_data();
 
     shared.reader_critical_section.reader_critical_section(|| {
-        // Using Relaxed here is fine because it was surrounded with light barriers
-        // which have SeqCst ordering with collector
-        let ptr = atomic_ptr.load(Ordering::Relaxed);
+        // Use Acquire ordering (not Relaxed) to avoid reading uninitialized data (caught by miri).
+        let ptr = atomic_ptr.load(Ordering::Acquire);
 
         match NonNull::new(ptr) {
             None => None,
