@@ -507,13 +507,21 @@ pub(crate) fn borrow_from_atomic_ptr_using_hazard_pointer<'a, T>(
         // If the heavy barrier is ordered before this, there are two cases:
         // - atomic ptr writer's SeqCst write is before collector heavy barrier, then the re-load can observe the new pointer
         // - atomic ptr writer's SeqCst write is after collector heavy barrier.
-        //   in that case the reader and writer has no ordering because light barrier doesn't sync with SeqCst.
+        //   in that case the reader and writer has direct no ordering because light barrier doesn't sync with SeqCst.
+        //   the reader and writer can only have indirect ordering via collector.
         //   the reader re-load can load stale pointer, which points to SdarcInner whose ref count sum is 0.
         //   but it's still safe because collector requires two iterations to free.
         //   the next collector iteration's heavy barrier will be likely after this light barrier, so collector can
         //   observe the hazard pointer if borrowing hasn't finished.
-        //   however there is a rare case where collector's next iteration's heavy barrier is still before this light barrier, but after the writer SeqCst write,
-        //   so collector can free it and borrowing is unsound! TODO
+        //   however there is a rare case where collector's next iteration's heavy barrier is still before this light barrier, but after the writer SeqCst write.
+        //   in that case, we need to consider that collector reads reference count using Acquire, and decrementing ref
+        //   count uses Release. swapping atomic pointer is SeqCst, but when SeqCst is used with acquire-release,
+        //   SeqCst is only as strong as acquire-release. but that's enough for safety.
+        //   if collector observes zero ref count sum, according to acquire-release, the swapped atomic pointer
+        //   should also be visible to collector (although collector doesn't load atomic pointer normally),
+        //   then in the next iteration's beginning's heavy barrier, the precondition says it's before this light
+        //   fence. the heavy barrier synchronizes-with this light fence, even just consider Release-Acquire ordering,
+        //   the reader thread can then observe new atomic pointer.
         membarrier2::light();
 
         let re_loaded_ptr = atomic_ptr.load(Ordering::Relaxed);
