@@ -9,7 +9,7 @@ Examples:
 - [The Concurrency Trap: How An Atomic Counter Stalled A Pipeline](https://www.conviva.ai/resource/the-concurrency-trap-how-an-atomic-counter-stalled-a-pipeline/)
 - [How a Single Line of Code Made a 24-core Server Slower Than a Laptop](https://pkolaczk.github.io/server-slower-than-a-laptop/)
 
-This library provides sharded-deferred-atomic-reference-counting (`Sdarc`). It can be used similar to `Arc`. A thread increment/decrement one counter shard according to thread id hash. The `Sdarc` can be freely sent and shared between threads, so one counter shard may become negative. There is a background thread periodically observing the counters and do freeing (it uses tagged counter and two-stage collecting to solve race condition). This reduces cache contention of incrementing/decrementing counter.
+This library provides sharded-deferred-atomic-reference-counting (`Sdarc`). It can be used similar to `Arc`. A thread increment/decrement one counter shard (In Linux the shard is determined by `sched_getcpu`. In other platforms it's determined by thread id hash). The `Sdarc` can be freely sent and shared between threads, so one counter shard may become negative. There is a background thread periodically observing the counters and do freeing (it uses tagged counter and two-stage collecting to solve race condition). This reduces cache contention of incrementing/decrementing counter.
 
 Different counter shards of one `Sdarc` are in different cache lines. But the different `Sdarc`'s counters in same shard can be put together. This saves memory. This library provides general sharded allocation functionality that allows allocating 8 bytes per shard. This library also supports sharded RwLock (reader acquire one sharded lock, writer acquire all locks, readers have low contention with each other).
 
@@ -28,5 +28,5 @@ This library doesn't suit these use ases:
 
 Compare it with Linux percpu-refcount:
 
-- Linux percpu-refcount has two stages. In the first stage, increment/decrement use the per-CPU ref count slot. When the original owner drops reference, it switches to one atomic counter using RCU. In `Sdarc` there is no special owner.
+- Linux percpu-refcount has two stages. In the first stage, increment/decrement use the per-CPU ref count slot. When the original owner drops reference, it switches to one atomic counter using RCU. In `Sdarc` there is no special owner, similar to `Arc`.
 - Linux precpu-refcount uses non-atomic operation to increment/decrement per-CPU ref count. It relies on the fact that kernel code cannot be preempted. The user program can get CPU id via `sched_getcpu` but the thread could be scheduled to another CPU core right after calling it, so the user program has to use atomic operation.

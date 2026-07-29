@@ -17,7 +17,11 @@ append-only-vec = "0.1"
 rustc-hash = "2.1"
 
 membarrier2 = "0.1"
-oneshot = {version =  "0.2",features = ["std"] }
+oneshot = { version = "0.2", features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["thread"] }
+# currently rustix sched_getcpu only supports linux-like and
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(miri)"] }

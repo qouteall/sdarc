@@ -65,7 +65,7 @@ impl AllocUnit {
 
     fn data_len_in_bytes() -> usize {
         // the added 1 is for usage flags. see the svg for structure
-        SLOT_COUNT_PER_UNIT * (1 + get_shard_count().0 as usize) * 8
+        SLOT_COUNT_PER_UNIT * (1 + get_shard_count().as_usize()) * 8
     }
 
     /// The `index_of_unit` will be used for deallocating.
@@ -381,9 +381,6 @@ pub(crate) struct ShardedAllocStatusReport {
 pub(crate) static FULL_SHARD_ALLOC: LazyLock<FullShardAlloc> =
     LazyLock::new(|| FullShardAlloc::initialize());
 
-/// Returns the total number of sharded-alloc slots currently marked as used.
-/// For leak-checking in tests: when everything is dropped except the
-/// reader-critical-section counter, the count should be exactly 1.
 #[cfg(test)]
 pub(crate) fn total_sharded_alloc_used_slots() -> usize {
     FULL_SHARD_ALLOC.get_status_report().total_used_slot_count

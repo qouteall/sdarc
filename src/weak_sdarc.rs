@@ -83,9 +83,7 @@ pub(crate) fn clear_weak_backref_impl<T>(ptr: SdarcInnerPtrErased) -> ClearWeakB
     if let Some(inner) = r.weak_inner_ref.get() {
         /// Reset the backref to null. the weak ref will no longer be able to upgrade.
         /// The clearing is one-way. after clearing, it cannot become non-null.
-        ///
-        /// Why use Relaxed ordering: see comment in [`WeakSdarc::upgrade`]
-        let swapped_ptr = inner.back_ref.swap(null_mut(), Ordering::Relaxed);
+        let swapped_ptr = inner.back_ref.swap(null_mut(), Ordering::Release);
         if swapped_ptr.is_null() {
             ClearWeakBackRefResult::WeakBackRefWasAlreadyNull
         } else {

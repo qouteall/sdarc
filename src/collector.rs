@@ -54,8 +54,6 @@ impl CollectorShared {
         Self {
             params,
             thread_handle: thread::spawn(move || collector_thread_main()),
-            // The CachePadded ensure the rwlock and vec's outer 3 fields (ptr, length and capacity) are in unique cache lines.
-            // The 8 ensures initial inner spaces are in unique cache lines.
             pending_to_track: ShardsArr::new(|_| {
                 CachePadded::new(Mutex::new(CollectorPendingDataShard::new()))
             }),
@@ -91,18 +89,12 @@ fn get_collector() -> &'static CollectorShared {
     COLLECTOR.get_or_init(|| CollectorShared::new(CollectorParams::new_from_env_var()))
 }
 
-/// Interrupt the collector thread from parking.
-///
-/// Make collector quickly collect the objects whose reference count sum become zero.
-pub fn collector_update_now() {
-    get_collector().thread_handle.thread().unpark();
-    // No need to add extra memory fences. The park synchronizes-with unpark.
-}
-
 /// Interrupt the collector from parking, and wait until it finishes one deep collection.
 ///
 /// Note: normally collector does shallow collection. For a deep structure it will collect layer-by-layer.
 /// Calling this makes collector do deep collection once.
+/// 
+/// This should not be called in drop, otherwise it may be called in collector thread thus deadlock.
 ///
 /// Why doesn't collector do deep collection by default:
 /// Collection uses heavy fence. The heavy fence sends interrupt to all CPU cores running
@@ -255,8 +247,6 @@ fn clear_tags_and_read_ref_count_sum_acquire(counters: ShardedDataPtr<AtomicTagg
     for shard_index in shard_indexes() {
         let atomic_counter = unsafe { counters.ptr_at_shard(shard_index).as_ref() };
 
-        /// Why use Relaxed ordering: the [`read_ref_count_sum_if_all_tags_unset_acquire`]
-        /// during re-check ensures correctness.
         let tagged_counter = atomic_counter.fetch_and_clear_tag_acquire();
         sum += tagged_counter.ref_count();
     }
@@ -565,8 +555,8 @@ struct CollectorThreadLocal {
     counters_to_recheck: RefCell<BTreeSet<ShardedDataPtr<AtomicTaggedCounter>>>,
 }
 
-/// It's only initialized in collector thread. Initialized in [`collector_thread_main`]
 thread_local! {
+    /// It's only initialized in collector thread. Initialized in [`collector_thread_main`]
     static COLLECTOR_THREAD_LOCAL: OnceCell<CollectorThreadLocal> = OnceCell::new();
 }
 
@@ -586,8 +576,11 @@ impl CollectorThreadLocal {
     }
 }
 
+/// This is just used for deep collection.
 pub(crate) fn on_sdarc_drop(counters_ptr: ShardedDataPtr<AtomicTaggedCounter>) {
-    COLLECTOR_THREAD_LOCAL.with(|cell| {
+    // This can be called in TLS destruction, so use try_with.
+    // Losing tracking is fine because it's only effective in collecctor thread.
+    let _r = COLLECTOR_THREAD_LOCAL.try_with(|cell| {
         match cell.get() {
             None => {
                 // This is not collector thread
@@ -596,5 +589,5 @@ pub(crate) fn on_sdarc_drop(counters_ptr: ShardedDataPtr<AtomicTaggedCounter>) {
                 collector_thread_local.add_pending_to_check(counters_ptr)
             }
         }
-    })
+    });
 }

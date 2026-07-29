@@ -1,5 +1,4 @@
 use crate::atomic_sdarc::{AtomicNullableSdarc, AtomicSdarc};
-use crate::collector::collector_update_now;
 use crate::sdarc::Sdarc;
 
 // ============================================================================
@@ -313,7 +312,6 @@ fn test_atomic_nullable_drop_cleans_up() {
     let atomic = AtomicNullableSdarc::new_with_value(String::from("hello"));
     atomic.store(Some(Sdarc::new(String::from("world"))));
     drop(atomic);
-    collector_update_now();
 }
 
 #[test]
@@ -322,5 +320,4 @@ fn test_atomic_sdarc_drop_cleans_up() {
     let atomic = AtomicSdarc::new(String::from("hello"));
     atomic.store(Sdarc::new(String::from("world")));
     drop(atomic);
-    collector_update_now();
 }

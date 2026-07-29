@@ -41,7 +41,7 @@ pub(crate) fn shard_count_from_env_var() -> Option<ShardCount> {
                     );
                 } else {
                     assert!(num > 0, "Shard count cannot be zero");
-                    Some(ShardCount(num as u16))
+                    Some(ShardCount::from_usize_ceil(num))
                 }
             }
             Err(err) => {

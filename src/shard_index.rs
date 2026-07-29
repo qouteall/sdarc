@@ -1,23 +1,62 @@
 use crate::env_params::shard_count_from_env_var;
 use std::cell::Cell;
-use std::cmp::min;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::{Index, IndexMut};
 use std::sync::LazyLock;
 use std::thread;
 
-/// Shard count can be at most 256
 #[derive(Copy, Clone, Debug)]
-pub struct ShardCount(pub u16);
+pub struct ShardCount {
+    exponent_of_two: u8,
+    mask: usize,
+}
+
+pub(crate) const MAX_SHARD_COUNT: usize = 256;
+
+const MIN_EXPONENT: u32 = 1;
+const MAX_EXPONENT: u32 = 8;
 
 impl ShardCount {
+    pub fn from_usize_exact(num: usize) -> Option<ShardCount> {
+        assert_ne!(num, 0);
+        if num.count_ones() != 1 {
+            // not a power of 2
+            return None;
+        }
+        let exponent = num.trailing_zeros();
+        let in_range = exponent.clamp(MIN_EXPONENT, MAX_EXPONENT);
+        Some(ShardCount {
+            exponent_of_two: in_range as u8,
+            mask: (1 << in_range) - 1,
+        })
+    }
+
+    pub fn from_usize_ceil(num: usize) -> ShardCount {
+        assert_ne!(num, 0);
+
+        if let Some(c) = Self::from_usize_exact(num) {
+            return c;
+        }
+
+        // not a power of two, ilog2 rounds down, so add 1
+        let exponent = num.ilog2() + 1;
+        let in_range = exponent.clamp(MIN_EXPONENT, MAX_EXPONENT);
+        ShardCount {
+            exponent_of_two: in_range as u8,
+            mask: (1 << in_range) - 1,
+        }
+    }
+
     pub fn as_usize(self) -> usize {
-        self.0 as usize
+        1 << (self.exponent_of_two as usize)
+    }
+
+    pub fn modulo(self, num: usize) -> ShardIndex {
+        ShardIndex((num & self.mask) as u8)
     }
 }
 
 static SHARD_COUNT: LazyLock<ShardCount> = LazyLock::new(init_shard_count);
-pub(crate) const MAX_SHARD_COUNT: usize = 256;
 
 fn init_shard_count() -> ShardCount {
     if let Some(c) = shard_count_from_env_var() {
@@ -30,18 +69,7 @@ fn init_shard_count() -> ShardCount {
 
     assert_ne!(available_parallelism, 0);
 
-    // Use 1.5 times of available parallelism.
-    // Because that, by default, shard index is determined by thread id hash mod shard count.
-    // If there are N cores, and there are N currently-running threads, some worker thread's shard index may collide,
-    // which increase contention.
-    // So increase shard count to reduce chance of contention.
-    // Also note that the collision can also be avoided by user manually calling `set_current_thread_shard_index`,
-    // we still increase shard count to reduce contention out-of-the-box.
-    let adjusted = available_parallelism + available_parallelism / 2;
-
-    let num = min(adjusted, MAX_SHARD_COUNT);
-
-    ShardCount(num as u16)
+    ShardCount::from_usize_ceil(available_parallelism)
 }
 
 /// The shard count won't change after initialization
@@ -56,18 +84,16 @@ pub fn get_shard_count() -> ShardCount {
 pub struct ShardIndex(u8);
 
 impl ShardIndex {
+    pub fn from_usize(value: usize) -> ShardIndex {
+        get_shard_count().modulo(value)
+    }
+
     pub fn from_u64(value: u64) -> ShardIndex {
-        let modulus: u64 = value % (get_shard_count().0 as u64);
-        ShardIndex(modulus as u8)
+        Self::from_usize(value as usize)
     }
 
     pub fn as_8(self) -> u8 {
         self.0
-    }
-
-    pub fn from_bounded_u8(value: u8) -> Self {
-        assert!((value as u16) < (get_shard_count().0));
-        Self(value)
     }
 
     pub fn as_usize(self) -> usize {
@@ -76,7 +102,7 @@ impl ShardIndex {
 }
 
 thread_local! {
-    static CURR_THREAD_SHARD_INDEX: Cell<ShardIndex> = {
+    static SHARD_INDEX_FROM_THREAD_ID_HASH: Cell<ShardIndex> = {
         Cell::new(shard_index_from_thread_id_hash())
     };
 }
@@ -90,28 +116,47 @@ fn shard_index_from_thread_id_hash() -> ShardIndex {
     ShardIndex::from_u64(value)
 }
 
-/// Note: current thread's shard index may be changed by [`set_current_thread_shard_index`]
+// The `rustix::thread::sched_getcpu()` only supports Linux, Android and dragonfly.
+// Side note: in rustix's `#[cfg(any(linux_kernel, target_os = "dragonfly"))]`
+// the `linux_kernel` is kind of misleading. The `linux_kernel` has nothing to do with Rust-for-Linux.
+// It's activated for user application for Linux (also Android).
+/// Get the current thread's shard index. It's computed from thread id hash.
+///
+/// It will have some collisions. Different threads may use the same shard index.
+#[cfg(not(target_os = "linux"))]
 pub fn curr_thread_shard_index() -> ShardIndex {
-    CURR_THREAD_SHARD_INDEX.get()
+    SHARD_INDEX_FROM_THREAD_ID_HASH.get()
 }
 
-/// The thread's shard index will by default be initialized using thread id hash.
+/// In Linux it uses sched_getcpu to get shard index.
 ///
-/// But there may be collisions. Two different threads get same shard index.
+/// The sched_getcpu normally uses vdso which doens't involve system call.
+/// It's kind of cheap so it can be used frequently.
 ///
-/// For the threads that you manage, you can set the shard index in each thread to manually avoid collision.
-pub fn set_current_thread_shard_index(shard_index: ShardIndex) {
-    CURR_THREAD_SHARD_INDEX.replace(shard_index);
+/// It doesn't use thread id hash. So it's free of shard index collision.
+///
+/// Even if shard index uses CPU index, the counter is still atomic, unlike Linux kernel's percpu-refcount,
+/// because the thread can be scheduled to another core right after calling sched_getcpu.
+#[cfg(target_os = "linux")]
+pub fn curr_thread_shard_index() -> ShardIndex {
+    get_shard_count().modulo(rustix::thread::sched_getcpu())
+    // The CPU index can be obtained without function call. https://docs.rs/percpu/latest/percpu/
+    // but it requires custom linker script.
+}
+
+/// Only for testing
+pub(crate) fn set_current_thread_shard_index(shard_index: ShardIndex) {
+    SHARD_INDEX_FROM_THREAD_ID_HASH.replace(shard_index);
 }
 
 pub fn shard_indexes() -> impl Iterator<Item = ShardIndex> {
-    (0..get_shard_count().0)
+    (0..get_shard_count().as_usize())
         .into_iter()
         .map(|i| ShardIndex(i as u8))
 }
 
 pub fn shard_indexes_until(shard_index: ShardIndex) -> impl Iterator<Item = ShardIndex> {
-    assert!((shard_index.0 as u16) <= get_shard_count().0);
+    assert!((shard_index.0 as usize) <= get_shard_count().as_usize());
     (0..shard_index.0).into_iter().map(|i| ShardIndex(i as u8))
 }
 

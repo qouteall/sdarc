@@ -1,5 +1,4 @@
 use crate::sdarc::Sdarc;
-use crate::collector::collector_update_now;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use crate::weak_sdarc::WeakSdarc;
@@ -205,9 +204,6 @@ fn test_drop_behavior_with_clones() {
     drop(c1);
     drop(c2);
     drop(c3);
-
-    // Wake up collector to process the drops
-    collector_update_now();
 }
 
 #[test]
@@ -252,6 +248,4 @@ fn test_many_clones_and_drops() {
     // Drop them all
     drop(sdarc);
     drop(clones);
-
-    collector_update_now();
 }

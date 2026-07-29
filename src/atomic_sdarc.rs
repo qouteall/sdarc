@@ -1,16 +1,22 @@
 //! Atomic Sdarc pointers.
 //!
 //! Note that it uses the asymmetric fence https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p1202r4.pdf
-//! via membarrier2 crate. The heavy fence uses OS API that sends interrupt to every core executing current process's
-//! thread. The light fence is just compiler fence. The light fence can sync with heavy fence similar to SeqCst.
-//! However, light fence don't sync between. And light fence don't sync with normal SeqCst.
-//! The asymmetric fence is not yet included in C++ memory model (that Rust uses).
+//! via membarrier2 crate.
+//!
+//! Summarize asymmetric fence:
+//! - Light fence is just compiler fence that prevents instruction reordering.
+//! - Heavy fence uses OS API that sends interrupt to every core executing current process's thread
+//! - The SeqCst operation implicitly includes a compiler fence. SeqCst operation "contains" light fence.
+//! - A light fence sync with heavy fence similar to SeqCst. However, the light fences don't sync with each other.
+//!   The light fences can have indirect ordering via the heavy fence.
+//! - The asymmetric fence is not yet included in C++ memory model (that Rust uses).
 //!
 //! The safety relies on:
 //! - The collector takes two iterations observing zero ref count sum to free one object.
 //! - The collector will run a `membarrier2::heavy()` before each iteration, then read hazard pointers,
 //!   and spin until observing reader critical section in inactive state once.
-//! - The atomic writer uses SeqCst which syncs with collector heavy barrier.
+//! - The reader light fence doesn't directly sync with writer. But they sync with collector heavy fence,
+//!   so the indirect ordering can be established.
 //!
 //! Hazard pointer prevents collector from collecting it. It's a way to keep pointee alive even
 //! when reference count sum is 0.
@@ -218,7 +224,6 @@ impl<T: Send + Sync> AtomicSdarc<T> {
 /// And it's hold with `CachePadded` which is 128 align in mainstream platform.
 /// If we use 8, then it wastes space. Using 15 will make padding space less than a pointer width.
 /// The added scanning is cheap because they are in same cache line.
-/// Mod by 15 is not slow because compiler can optimize it into multiplication.
 const HZ_PTR_SLOT_COUNT: usize = 15;
 
 #[derive(Copy, Clone, Debug)]
@@ -246,7 +251,7 @@ struct HzSlotIndex(u8);
 /// Collector thread:
 /// 1. heavy barrier
 /// 2. for each thread's critical section flag, poll using Acquire until observing false
-/// 3. read counter sum in Acquire ordering. if it stays 0, clear tags
+/// 3. read counter sum in Acquire ordering. if it stays 0, clear tags (there is a relaxed pre-read before, doesn't matter in ordering)
 /// 4. in next collector inner iteration, heavy barrier again, poll until observing false again
 /// 5. read counter sum in Acquire ordering, if it stays 0 and no tag is observed, free the memory
 ///
@@ -273,9 +278,9 @@ struct HzSlotIndex(u8);
 ///   and writer's decrementing of ref count uses Release, and writer's swapping of pointer is before decrementing ref
 ///   count, so the swapped pointer was observable to collector. Now RL is after CH, so the swapped pointer should also
 ///   be observable to reader. Reader won't read the stale pointer that is about to be freed.
-pub(crate) struct PerThreadReaderCriticalSection(AtomicBool);
+pub(crate) struct PerThreadReaderCriticalSectionFlag(AtomicBool);
 
-impl PerThreadReaderCriticalSection {
+impl PerThreadReaderCriticalSectionFlag {
     fn new() -> Self {
         Self(AtomicBool::new(false))
     }
@@ -303,6 +308,7 @@ impl PerThreadReaderCriticalSection {
         self.0.load(Ordering::Relaxed)
     }
 
+    /// Spin until observing that flag being false once.
     fn collector_poll_until_false(&self) {
         loop {
             let r = self.0.load(Ordering::Acquire);
@@ -322,7 +328,7 @@ pub(crate) struct PerThreadSharedHazardData {
     pub hazard_ptr_slots: [AtomicPtr<u8>; HZ_PTR_SLOT_COUNT],
     pub is_used: AtomicBool,
 
-    pub reader_critical_section: PerThreadReaderCriticalSection,
+    pub reader_critical_section_flag: PerThreadReaderCriticalSectionFlag,
 }
 
 impl PerThreadSharedHazardData {
@@ -367,7 +373,7 @@ fn obtain_per_thread_shared_hazard_data() -> &'static PerThreadSharedHazardData 
     let r = PerThreadSharedHazardData {
         hazard_ptr_slots: array::from_fn(|_| AtomicPtr::new(null_mut())),
         is_used: AtomicBool::new(true),
-        reader_critical_section: PerThreadReaderCriticalSection::new(),
+        reader_critical_section_flag: PerThreadReaderCriticalSectionFlag::new(),
     };
     let idx = SHARED_HAZARD_DATA.push(CachePadded::new(r));
     let result = &SHARED_HAZARD_DATA[idx];
@@ -379,9 +385,11 @@ fn release_hazard_data(r: &'static PerThreadSharedHazardData) {
     assert!(
         r.hazard_ptr_slots
             .iter()
-            .all(|ptr| ptr.load(Ordering::Relaxed).is_null())
+            .all(|ptr| ptr.load(Ordering::Relaxed).is_null()),
+        "During thread-local destruction, all hazard pointer borrowing should finish. \
+        You should NOT make thread-local own an AtomicSdarcBorrowGuard."
     );
-    assert!(r.reader_critical_section.get_relaxed().not());
+    assert!(r.reader_critical_section_flag.get_relaxed().not());
 
     let old_used = r.is_used.swap(false, Ordering::Release);
     assert!(old_used);
@@ -433,16 +441,13 @@ pub(crate) fn traverse_atomic_reader_signals() -> HazardPointerSet {
             }
         }
 
-        // Spin until observing is_loading_owned_sdarc being false
-        // Use SeqCst ordering. (Using Acquire ordering pure load may observe arbitrarily stale data)
-        data.reader_critical_section.collector_poll_until_false();
+        data.reader_critical_section_flag.collector_poll_until_false();
     });
 
     HazardPointerSet(hazard_ptr_set)
 }
 
 /// This guard should be held in local variable. It should not be owned by thread local.
-/// Because its dropping uses other thread locals.
 pub(crate) struct HazardPointerGuard<'a, T> {
     hazard_slot_index: HzSlotIndex,
     loaded_ptr: ManuallyDrop<Sdarc<T>>,
@@ -526,8 +531,9 @@ pub(crate) enum HazardBorrowErr {
 /// (reader can be un-scheduled here)
 /// 2. publish hazard pointer, Relaxed
 /// 3. light fence
-/// 4. re-load atomic ptr, Relaxed
+/// 4. re-load atomic ptr, Acquire
 /// 5. if two pointers equal, borrowing succeeded
+/// 6. (after borrowing finishes, clear hazard pointer in Release)
 ///
 /// Writer:
 /// 1. swap atomic ptr, SeqCst
@@ -535,7 +541,7 @@ pub(crate) enum HazardBorrowErr {
 ///
 /// Collector:
 /// 1. in beginning of first iteration, heavy barrier
-/// 2. read hazard pointers, Relaxed
+/// 2. read hazard pointers, Acquire
 /// 3. for a non-hazard `SdarcInner`, read reference count, if observe zero sum, clear tags, read ref count using Acquire
 /// 4. in beginning of second iteration, heavy barrier
 /// 5. read hazard pointers, Relaxed
@@ -657,7 +663,7 @@ fn unpublish_hazard_pointer_on_borrow_finish<T>(
 pub(crate) fn load_atomic_ptr_owned<T>(atomic_ptr: &AtomicPtr<SdarcInner<T>>) -> Option<Sdarc<T>> {
     let shared = curr_thread_shared_hazard_data();
 
-    shared.reader_critical_section.reader_critical_section(|| {
+    shared.reader_critical_section_flag.reader_critical_section(|| {
         // Use Acquire ordering (not Relaxed) to avoid reading uninitialized data (caught by miri).
         let ptr = atomic_ptr.load(Ordering::Acquire);
 
