@@ -16,7 +16,7 @@ pub(crate) struct WeakSdarcInner<T> {
     /// The `WeakSdarc` may be unable to upgrade or may can upgrade after resurrection,
     /// depending on whether backref is cleared, which depends on collector timing.
     ///
-    /// It's similar to [`AtomicNullableSdarc`], except that it doesn't own a reference count.
+    /// It's similar to [`crate::atomic_sdarc::AtomicNullableSdarc`], except that it doesn't own a reference count.
     back_ref: AtomicPtr<SdarcInner<T>>,
 }
 
@@ -46,18 +46,19 @@ pub struct WeakSdarc<T> {
     sdarc_weak_inner: Sdarc<WeakSdarcInner<T>>,
 }
 
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum ClearWeakBackRefResult {
     WeakRefNotInvolved,
     WeakBackRefCleared,
     WeakBackRefWasAlreadyNull,
 }
 
-/// When this function is called, the strong count sum reaches 0.
+/// When this function is called, the strong count sum reaches 0, and there is no hazard pointer to it.
 /// But there may be weak references, and the weak references can still upgrade at the same time.
 ///
 /// But the [`SdarcInner::weak_inner_ref`] will never be initialized at that time if it is not initialized,
-/// because it can only be initialized from strong reference, and strong reference doesn't exist
-/// if no weak reference to it exists.
+/// because it can only be initialized from strong reference downgrading, and strong reference doesn't exist
+/// at that time.
 ///
 /// If [`SdarcInner::weak_inner_ref`] has been initialized, it will clear the backref.
 /// After clearing, weak ref's upgrade will fail. And the backref will never become non-null again.
@@ -135,7 +136,7 @@ impl<T: Send + Sync> WeakSdarc<T> {
     }
 
     /// Unlike std `Weak`, the `WeakSdarc` can be borrowed without upgrading.
-    /// The pointee is kept alive using hazard pointer and "debt paying" mechanism.
+    /// The pointee is kept alive using hazard pointer mechanism.
     #[allow(clippy::needless_lifetimes)]
     pub fn borrow<'a>(&'a self) -> Option<AtomicSdarcBorrowGuard<'a, T>> {
         let weak_inner: &WeakSdarcInner<T> = self.sdarc_weak_inner.deref();

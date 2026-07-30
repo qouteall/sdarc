@@ -44,6 +44,7 @@ impl<T> Sdarc<T> {
     }
 
     /// Creating a `Sdarc` from raw pointer without incrementing reference count if not null
+    #[allow(clippy::manual_map)]
     pub(crate) unsafe fn nullable_from_raw_ptr(old_ptr: *mut SdarcInner<T>) -> Option<Sdarc<T>> {
         match NonNull::new(old_ptr) {
             None => None,
@@ -200,7 +201,7 @@ impl<T> Drop for Sdarc<T> {
         /// What about incrementing a Sdarc reference count then send to another thread to decrement?
         /// The sending data between threads will do synchronization that ensures increment happens-before decrement.
         ///
-        /// What about current thread change shard index using [`shard_index::set_current_thread_shard_index`]?
+        /// What about current thread shard index changed?
         /// The thread could increment one shard counter, change its shard index, then decrement another shard's
         /// counter.
         /// It's still fine, because in same thread the increment is sequenced-before decrement,

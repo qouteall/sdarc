@@ -51,9 +51,13 @@ impl CollectorPendingDataShard {
 
 impl CollectorShared {
     fn new(params: CollectorParams) -> Self {
+        let thread_handle = thread::Builder::new()
+            .name("sdarc-collector".to_string())
+            .spawn(collector_thread_main)
+            .expect("Spawning sdarc collector thread");
         Self {
             params,
-            thread_handle: thread::spawn(move || collector_thread_main()),
+            thread_handle,
             pending_to_track: ShardsArr::new(|_| {
                 CachePadded::new(Mutex::new(CollectorPendingDataShard::new()))
             }),
@@ -93,7 +97,7 @@ fn get_collector() -> &'static CollectorShared {
 ///
 /// Note: normally collector does shallow collection. For a deep structure it will collect layer-by-layer.
 /// Calling this makes collector do deep collection once.
-/// 
+///
 /// This should not be called in drop, otherwise it may be called in collector thread thus deadlock.
 ///
 /// Why doesn't collector do deep collection by default:
@@ -338,7 +342,7 @@ impl CollectorThreadState {
                 // It will not cause deadloop because that Sdarc is living and the pre-check should be non-zero.
                 // What about the race condition where [0, 1] becomes [1, 1] then [1, 0]?
                 // It won't cause memory safety issue because tagged counter will be observed then it delays freeing.
-                // Then its state will become DefaultState ad won't go into to_re_check.
+                // Then its state will become DefaultState and won't go into to_re_check.
 
                 loop_counter += 1;
                 if loop_counter == 100000 {
@@ -446,7 +450,7 @@ impl CollectorThreadState {
 
     fn free_pointers(&mut self, to_free: &mut Vec<ShardedDataPtr<AtomicTaggedCounter>>) {
         for counters_ptr in to_free {
-            let tracked_counter = self.tracked_counters.remove(&counters_ptr).unwrap();
+            let tracked_counter = self.tracked_counters.remove(counters_ptr).unwrap();
             assert!(matches!(
                 tracked_counter.state,
                 TrackedCounterState::ReadyToFree
@@ -467,7 +471,7 @@ impl CollectorThreadState {
     }
 
     /// It uses locking. The locking ensures that when it starts tracking a `SdarcInner`,
-    /// so the collector won't observe uninitialized counter or uninitialized pointee.
+    /// the collector won't observe uninitialized counter or uninitialized pointee.
     fn take_new_counters_to_track(&mut self) {
         for shard_index in shard_indexes() {
             // Use empty container to replace it, minimize time of taking lock
@@ -551,13 +555,13 @@ struct CollectorThreadLocal {
     /// To solve that layer-by-layer dropping issue, we do special treatments for dropping in collector thread.
     /// In [`Sdarc::drop`] it uses thread local to see whether it's the collector thread. If is, then
     /// the ptr is added to this set. The collector then re-check this set and do immediate updates without waiting.
-    /// In the between the collector goes through reader critical section to ensure safety.
+    /// In the between the collector polls reader critical section to ensure safety.
     counters_to_recheck: RefCell<BTreeSet<ShardedDataPtr<AtomicTaggedCounter>>>,
 }
 
 thread_local! {
     /// It's only initialized in collector thread. Initialized in [`collector_thread_main`]
-    static COLLECTOR_THREAD_LOCAL: OnceCell<CollectorThreadLocal> = OnceCell::new();
+    static COLLECTOR_THREAD_LOCAL: OnceCell<CollectorThreadLocal> = const { OnceCell::new() };
 }
 
 impl CollectorThreadLocal {
@@ -579,7 +583,7 @@ impl CollectorThreadLocal {
 /// This is just used for deep collection.
 pub(crate) fn on_sdarc_drop(counters_ptr: ShardedDataPtr<AtomicTaggedCounter>) {
     // This can be called in TLS destruction, so use try_with.
-    // Losing tracking is fine because it's only effective in collecctor thread.
+    // Losing tracking is fine because it's only effective in collector thread.
     let _r = COLLECTOR_THREAD_LOCAL.try_with(|cell| {
         match cell.get() {
             None => {

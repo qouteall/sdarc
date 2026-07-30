@@ -1,12 +1,14 @@
 //! Structure of sharded alloc
 #![doc= include_str!("../docs/shard_alloc.drawio.svg")]
 
+use crate::env_params::disable_sharded_alloc_maintenance;
 use crate::shard_index::{
     ShardIndex, ShardsArr, curr_thread_shard_index, get_shard_count, shard_indexes,
     shard_indexes_until,
 };
+use crossbeam_utils::CachePadded;
 use log::trace;
-use parking_lot::{Mutex};
+use parking_lot::Mutex;
 use scopeguard::guard_on_unwind;
 use std::alloc::{Layout, alloc, dealloc};
 use std::hash::{Hash, Hasher};
@@ -16,8 +18,6 @@ use std::ops::{DerefMut, Index, IndexMut, Not, Sub};
 use std::ptr::{NonNull, drop_in_place};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use crossbeam_utils::CachePadded;
-use crate::env_params::disable_sharded_alloc_maintenance;
 
 /// Each slot is 8 bytes (same size as `u64`).
 /// In mainstream platforms (X86-64 and ARM64), CachePadded use 128 alignment, which is 16 `u64`s.
@@ -56,11 +56,11 @@ impl AllocUnit {
     fn get_layout() -> Layout {
         let len_bytes = Self::data_len_in_bytes();
 
-        let layout = Layout::from_size_align(
-            len_bytes, 8 * 16, // the alignment should match cache line in main platforms
+        Layout::from_size_align(
+            len_bytes,
+            8 * 16, // the alignment should match cache line in main platforms
         )
-        .unwrap();
-        layout
+        .unwrap()
     }
 
     fn data_len_in_bytes() -> usize {
@@ -134,7 +134,7 @@ impl AllocUnit {
     fn usage_flag_atomics<'a>(&'a self) -> impl Iterator<Item = &'a AtomicU64> {
         let u64_ptr = self.data_ptr.cast::<u64>();
 
-        (0..SLOT_COUNT_PER_UNIT).into_iter().map(move |slot_index| {
+        (0..SLOT_COUNT_PER_UNIT).map(move |slot_index| {
             let offseted_ptr = unsafe { u64_ptr.offset(slot_index as isize) };
             unsafe { offseted_ptr.cast::<AtomicU64>().as_ref() }
         })
@@ -178,7 +178,7 @@ impl Drop for AllocUnit {
     }
 }
 
-/// There one group per shard. There is another group for temporary-filling which aim to reduce maintenance lock time.
+/// One group per shard. There is another group for temporary-filling which aim to reduce maintenance lock time.
 pub(crate) struct AllocUnitGroup {
     all_units: Vec<AllocUnit>,
 
@@ -316,6 +316,7 @@ impl FullShardAlloc {
 
     fn get_status_report(&self) -> ShardedAllocStatusReport {
         // Collector can run in parallel and swap shards thus make number inaccurate. Lock all locks to prevent.
+        // Locking order should be consistent to avoid deadlock.
         let temp_guard = self.temp_filling_group.lock();
         let shard_guards: Vec<_> = shard_indexes().map(|i| self.groups[i].lock()).collect();
 
@@ -379,7 +380,7 @@ pub(crate) struct ShardedAllocStatusReport {
 }
 
 pub(crate) static FULL_SHARD_ALLOC: LazyLock<FullShardAlloc> =
-    LazyLock::new(|| FullShardAlloc::initialize());
+    LazyLock::new(FullShardAlloc::initialize);
 
 #[cfg(test)]
 pub(crate) fn total_sharded_alloc_used_slots() -> usize {
@@ -496,7 +497,6 @@ impl<T: Send + Sync> ShardedBox<T> {
         Self(ptr)
     }
 
-    /// Note: the current thread's shard index can be mutated by [`shard_index::set_current_thread_shard_index`]
     pub fn at_curr_thread_shard(&self) -> &T {
         unsafe { self.0.ptr_at_curr_thread_shard().as_ref() }
     }

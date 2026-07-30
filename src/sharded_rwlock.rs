@@ -11,9 +11,9 @@ use std::ops::{Deref, DerefMut};
 /// It makes read locking faster (lower contention) and write locking slower.
 ///
 /// It's similar to crossbeam [`crossbeam_utils::sync::sharded_lock::ShardedLock`]. Re-implement because
-/// 1. ensure shard index matches,
-/// 2. allocate the lock shards in more efficient manner (less padding),
-/// 3. use parking lot mutex instead of std mutex, which is usually faster and has no poison mechanism.
+/// 1. allocate the lock shards using this library's sharded alloc. so having many `ShardedRwLocks` saves
+///    memory compared to crossbeam `ShardedLock`
+/// 2. use parking_lot rwlock instead of std rwlock, which is usually faster and has no poison mechanism.
 pub struct ShardedRwLock<T> {
     data: UnsafeCell<T>,
     locks: ShardedBox<RwLock<()>>,

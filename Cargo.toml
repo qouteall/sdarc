@@ -1,15 +1,23 @@
 [package]
 name = "sdarc"
 version = "0.1.0"
+authors = ["qouteall"]
 edition = "2024"
 description = "Sharded Deferred Atomic Reference Counting"
+rust-version = "1.95.0"
+repository = "https://github.com/qouteall/sdarc"
+readme = "README.md"
+keywords = ["atomic", "arc", "reference-counting"]
+categories = ["data-structures", "memory-management"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 crossbeam-utils = "0.8"
 
-# use on-github version to make it runnable in miri
+parking_lot = "0.12"
+# to run miri, use the parking_lot from github
 # parking_lot currently has no release since fixing https://github.com/Amanieu/parking_lot/issues/477
-parking_lot = { git = "https://github.com/Amanieu/parking_lot", branch = "master" }
+#parking_lot = { git = "https://github.com/Amanieu/parking_lot", branch = "master" }
 
 scopeguard = "1.2"
 log = "0.4"

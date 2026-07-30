@@ -366,14 +366,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lock_api"
-version = "0.4.14"
-source = "git+https://github.com/Amanieu/parking_lot?branch=master#d20d71e5a8955ec1d2a53e3659142a505476bb3d"
-dependencies = [
- "scopeguard",
-]
-
-[[package]]
 name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -471,17 +463,8 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api 0.4.14 (registry+https://github.com/rust-lang/crates.io-index)",
- "parking_lot_core 0.9.12 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
-name = "parking_lot"
-version = "0.12.5"
-source = "git+https://github.com/Amanieu/parking_lot?branch=master#d20d71e5a8955ec1d2a53e3659142a505476bb3d"
-dependencies = [
- "lock_api 0.4.14 (git+https://github.com/Amanieu/parking_lot?branch=master)",
- "parking_lot_core 0.9.12 (git+https://github.com/Amanieu/parking_lot?branch=master)",
+ "lock_api",
+ "parking_lot_core",
 ]
 
 [[package]]
@@ -489,18 +472,6 @@ name = "parking_lot_core"
 version = "0.9.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
-dependencies = [
- "cfg-if",
- "libc",
- "redox_syscall",
- "smallvec",
- "windows-link",
-]
-
-[[package]]
-name = "parking_lot_core"
-version = "0.9.12"
-source = "git+https://github.com/Amanieu/parking_lot?branch=master#d20d71e5a8955ec1d2a53e3659142a505476bb3d"
 dependencies = [
  "cfg-if",
  "libc",
@@ -676,7 +647,7 @@ dependencies = [
  "log",
  "membarrier2",
  "oneshot",
- "parking_lot 0.12.5 (git+https://github.com/Amanieu/parking_lot?branch=master)",
+ "parking_lot",
  "rustc-hash",
  "rustix",
  "scopeguard",
@@ -736,7 +707,7 @@ dependencies = [
  "futures-util",
  "log",
  "once_cell",
- "parking_lot 0.12.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "parking_lot",
  "serial_test_derive",
 ]
 
