@@ -8,6 +8,7 @@ use std::mem;
 use std::mem::offset_of;
 use std::ops::Deref;
 use std::hash::Hash;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::ptr::{NonNull, null_mut};
 use std::sync::OnceLock;
 use crate::weak_sdarc::{clear_weak_backref_impl, ClearWeakBackRefResult, WeakSdarcInner};
@@ -142,6 +143,10 @@ impl<T> Sdarc<T> {
 
 unsafe impl<T: Send> Send for Sdarc<T> {}
 unsafe impl<T: Sync> Sync for Sdarc<T> {}
+
+// without these two, cargo doc will hang. probably a bug of rustdoc. reproduced in 1.97.1 TODO
+impl<T: RefUnwindSafe> UnwindSafe for Sdarc<T> {}
+impl<T: RefUnwindSafe> RefUnwindSafe for Sdarc<T> {}
 
 pub(crate) struct SdarcInner<T> {
     /// One counter shard can go negative. The sum of them matters.
