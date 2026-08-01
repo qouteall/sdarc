@@ -73,7 +73,7 @@ impl CollectorShared {
         counters_ptr: ShardedDataPtr<AtomicTaggedCounter>,
     ) {
         self.pending_to_track
-            .at_curr_thread_shard()
+            .at_curr_shard()
             .lock()
             .new_counters_to_track
             .push((fat_ptr, counters_ptr));

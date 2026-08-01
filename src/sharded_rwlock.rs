@@ -30,7 +30,7 @@ impl<T: Send + Sync> ShardedRwLock<T> {
 
     /// It only locks the shard corresponding to current thread. It's likely low-contention.
     pub fn read<'a>(&'a self) -> ReadGuardOfShardedRwLock<'a, T> {
-        let lock_shard: &RwLock<()> = self.locks.at_curr_thread_shard();
+        let lock_shard: &RwLock<()> = self.locks.at_curr_shard();
 
         ReadGuardOfShardedRwLock {
             _raw_guard: lock_shard.read(),
@@ -39,7 +39,7 @@ impl<T: Send + Sync> ShardedRwLock<T> {
     }
 
     pub fn try_read<'a>(&'a self) -> Option<ReadGuardOfShardedRwLock<'a, T>> {
-        let lock_shard: &RwLock<()> = self.locks.at_curr_thread_shard();
+        let lock_shard: &RwLock<()> = self.locks.at_curr_shard();
 
         if let Some(guard) = lock_shard.try_read() {
             Some(ReadGuardOfShardedRwLock {

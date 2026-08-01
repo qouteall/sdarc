@@ -28,8 +28,10 @@ membarrier2 = "0.1"
 oneshot = { version = "0.2", features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1", features = ["thread"] }
-# currently rustix sched_getcpu only supports linux-like and
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = "0.61"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(miri)"] }
@@ -42,9 +44,23 @@ serial_test = "3"
 [[bench]]
 name = "collector_bench"
 harness = false
+# slow, so disabled by default. run explicitly via `cargo bench --bench collector_bench`
+bench = false
 
 [[bench]]
-name = "comparison_bench"
+name = "atomic_read_bench"
+harness = false
+
+[[bench]]
+name = "clone_drop_contention_bench"
+harness = false
+
+[[bench]]
+name = "clone_drop_single_thread_bench"
+harness = false
+
+[[bench]]
+name = "shard_index_bench"
 harness = false
 
 [profile.release]

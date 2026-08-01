@@ -15,12 +15,12 @@ use crate::weak_sdarc::{clear_weak_backref_impl, ClearWeakBackRefResult, WeakSda
 
 /// Sharded deferred atomic reference counting.
 ///
+/// It can be used similar to `Arc`.
+///
 /// Its counters are sharded. Each clone or drop will only change the counter shard corresponding to current thread.
-/// So it will have much fewer cache contention than std `Arc`.
+/// So it will have much fewer cache contention than std `Arc`. When the counter sum goes 0, it's not immediately freed. It's freed by the background collector deferred.
 ///
-/// When the counter sum goes 0, it's not immediately freed. It's freed by the background collector deferred.
-///
-/// It doesn't support variable-sized type due to internal implementation.
+/// It doesn't support variable-sized type in current version.
 pub struct Sdarc<T> {
     pub(crate) inner_ptr: NonNull<SdarcInner<T>>,
 }
@@ -144,7 +144,7 @@ impl<T> Sdarc<T> {
 unsafe impl<T: Send> Send for Sdarc<T> {}
 unsafe impl<T: Sync> Sync for Sdarc<T> {}
 
-// without these two, cargo doc will hang. probably a bug of rustdoc. reproduced in 1.97.1 TODO
+// without these two, cargo doc will hang. probably a bug of rustdoc. https://github.com/rust-lang/rust/issues/160280
 impl<T: RefUnwindSafe> UnwindSafe for Sdarc<T> {}
 impl<T: RefUnwindSafe> RefUnwindSafe for Sdarc<T> {}
 
@@ -164,7 +164,7 @@ impl<T: Send + Sync> SdarcInner<T> {
         /// Why use Relaxed ordering is ok: submitting it to collector uses locking,
         /// which ensures collector doesn't see counters before this increment.
         counters
-            .at_curr_thread_shard()
+            .at_curr_shard()
             .increment_ref_count_relaxed();
 
         SdarcInner {
@@ -183,7 +183,7 @@ impl<T> Clone for Sdarc<T> {
         // so that incrementing will be before it's observable by other threads.
         self.inner_ref()
             .counters
-            .at_curr_thread_shard()
+            .at_curr_shard()
             .increment_ref_count_relaxed();
 
         Self {
@@ -215,7 +215,7 @@ impl<T> Drop for Sdarc<T> {
         /// the collector can observe the increment in another counter shard.
         self.inner_ref()
             .counters
-            .at_curr_thread_shard()
+            .at_curr_shard()
             .decrement_ref_count_and_set_tag_release();
     }
 }

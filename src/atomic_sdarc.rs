@@ -122,7 +122,7 @@ impl<T> AtomicNullableSdarc<T> {
                 if let Some(then_set_inner) = unsafe { then_set_ptr.as_ref() } {
                     then_set_inner
                         .counters
-                        .at_curr_thread_shard()
+                        .at_curr_shard()
                         .increment_ref_count_relaxed();
                 }
 
@@ -146,7 +146,7 @@ impl<T> AtomicNullableSdarc<T> {
         borrow_from_atomic_ptr(&self.inner_ptr)
     }
 
-    /// The `borrow` is fast enough for reader. But if you want blazing-fast read,
+    /// The `borrow` is fast enough for reader. But if you want faster read that avoids hazard pointer cost,
     /// you can keep a local (per-thread) `Sdarc<T>`, then periodically sync the atomic pointer to local `Sdarc<T>`.
     /// If the atomic pointer doesn't change, the sync involves almost no cost.
     ///
@@ -214,7 +214,7 @@ impl<T: Send + Sync> AtomicSdarc<T> {
         self.0.borrow().unwrap()
     }
 
-    /// The `borrow` is fast enough for reader. But if you want blazing-fast read,
+    /// The `borrow` is fast enough for reader. But if you want faster read that avoids hazard pointer cost,
     /// you can keep a local (per-thread) `Sdarc<T>`, then periodically sync the atomic pointer to local `Sdarc<T>`.
     /// If the atomic pointer doesn't change, the sync involves almost no cost.
     ///
@@ -680,7 +680,7 @@ pub(crate) fn load_atomic_ptr_owned<T>(atomic_ptr: &AtomicPtr<SdarcInner<T>>) ->
                     let r = unsafe { ptr.as_ref() };
 
                     r.counters
-                        .at_curr_thread_shard()
+                        .at_curr_shard()
                         .increment_ref_count_relaxed();
 
                     Some(unsafe { Sdarc::from_raw_ptr(ptr) })

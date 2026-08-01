@@ -3,7 +3,7 @@
 
 use crate::env_params::disable_sharded_alloc_maintenance;
 use crate::shard_index::{
-    ShardIndex, ShardsArr, curr_thread_shard_index, get_shard_count, shard_indexes,
+    ShardIndex, ShardsArr, get_shard_count, shard_indexes,
     shard_indexes_until,
 };
 use crossbeam_utils::CachePadded;
@@ -18,6 +18,7 @@ use std::ops::{DerefMut, Index, IndexMut, Not, Sub};
 use std::ptr::{NonNull, drop_in_place};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use crate::curr_shard_index;
 
 /// Each slot is 8 bytes (same size as `u64`).
 /// In mainstream platforms (X86-64 and ARM64), CachePadded use 128 alignment, which is 16 `u64`s.
@@ -273,7 +274,7 @@ impl FullShardAlloc {
         &self,
         init_func: impl Fn(ShardIndex) -> T,
     ) -> ShardedDataPtr<T> {
-        let shard_index = curr_thread_shard_index();
+        let shard_index = curr_shard_index();
         let shard = &self.groups[shard_index];
 
         let mut g = shard.lock();
@@ -456,8 +457,8 @@ impl<T> ShardedDataPtr<T> {
     }
 
     /// Creating pointer is not unsafe. But using pointer is unsafe.
-    pub(crate) fn ptr_at_curr_thread_shard(self) -> NonNull<T> {
-        self.ptr_at_shard(curr_thread_shard_index())
+    pub(crate) fn ptr_at_curr_shard(self) -> NonNull<T> {
+        self.ptr_at_shard(curr_shard_index())
     }
 
     fn usage_flag_ptr(self) -> NonNull<AtomicU64> {
@@ -497,8 +498,8 @@ impl<T: Send + Sync> ShardedBox<T> {
         Self(ptr)
     }
 
-    pub fn at_curr_thread_shard(&self) -> &T {
-        unsafe { self.0.ptr_at_curr_thread_shard().as_ref() }
+    pub fn at_curr_shard(&self) -> &T {
+        unsafe { self.0.ptr_at_curr_shard().as_ref() }
     }
 }
 

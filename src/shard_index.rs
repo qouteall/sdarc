@@ -1,12 +1,10 @@
 use crate::env_params::shard_count_from_env_var;
-use std::cell::Cell;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::{Index, IndexMut};
 use std::sync::LazyLock;
 use std::thread;
 
 // Shard count is power of 2. Because that we need to frequently turn CPU index to shared index.
-// Computing modulo to non-constant is slow.
+// Computing modulo to non-constant non-power-of-2 is slow.
 #[derive(Copy, Clone, Debug)]
 pub struct ShardCount {
     exponent_of_two: u8,
@@ -93,53 +91,6 @@ impl ShardIndex {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-thread_local! {
-    static SHARD_INDEX_FROM_THREAD_ID_HASH: Cell<ShardIndex> = {
-        Cell::new(shard_index_from_thread_id_hash())
-    };
-}
-
-#[cfg(not(target_os = "linux"))]
-fn shard_index_from_thread_id_hash() -> ShardIndex {
-    let thread_id = thread::current().id();
-    let mut hasher = DefaultHasher::new();
-    thread_id.hash(&mut hasher);
-    let value: u64 = hasher.finish();
-
-    ShardIndex::from_u64(value)
-}
-
-/// Get the current thread's shard index. It's computed from thread id hash.
-///
-/// It will have some collisions. Different threads may use the same shard index.
-#[cfg(not(target_os = "linux"))]
-pub fn curr_thread_shard_index() -> ShardIndex {
-    SHARD_INDEX_FROM_THREAD_ID_HASH.get()
-}
-
-/// In Linux it uses sched_getcpu to get shard index.
-///
-/// The sched_getcpu normally uses vdso which doesn't involve system call.
-/// It's kind of cheap so it can be used frequently.
-///
-/// It doesn't use thread id hash. So it's free of shard index collision.
-///
-/// Even if shard index uses CPU index, the counter is still atomic, unlike Linux kernel's percpu-refcount,
-/// because the thread can be scheduled to another core right after calling sched_getcpu.
-#[cfg(target_os = "linux")]
-pub fn curr_thread_shard_index() -> ShardIndex {
-    get_shard_count().modulo(rustix::thread::sched_getcpu())
-    // Side notes:
-    // The CPU index can be obtained without function call. https://docs.rs/percpu/latest/percpu/
-    // but it requires custom linker script.
-    //
-    // The `rustix::thread::sched_getcpu()` only supports Linux, Android and dragonfly.
-    // Side note: in rustix's `#[cfg(any(linux_kernel, target_os = "dragonfly"))]`
-    // the `linux_kernel` is kind of misleading. The `linux_kernel` has nothing to do with Rust-for-Linux.
-    // It's activated for user application for Linux (also Android).
-}
-
 pub fn shard_indexes() -> impl Iterator<Item = ShardIndex> {
     (0..get_shard_count().as_usize()).map(|i| ShardIndex(i as u8))
 }
@@ -169,8 +120,8 @@ impl<T> ShardsArr<T> {
         ShardsArr(vec.into_boxed_slice())
     }
 
-    pub fn at_curr_thread_shard(&self) -> &T {
-        &self.0[curr_thread_shard_index().as_usize()]
+    pub fn at_curr_shard(&self) -> &T {
+        &self.0[curr_shard_index().as_usize()]
     }
 }
 
@@ -186,4 +137,61 @@ impl<T> IndexMut<ShardIndex> for ShardsArr<T> {
     fn index_mut(&mut self, index: ShardIndex) -> &mut Self::Output {
         &mut self.0[index.as_usize()]
     }
+}
+
+// Linux -----
+
+/// In Linux, the current shard index is obtained by libc `sched_getcpu`.
+/// In common cases, `sched_getcpu` does not do syscall. It's fast enough.
+///
+/// However note that in some rare cases `sched_getcpu` does syscall, which makes it slow:
+/// - When using musl, in ARM64(Aarch64), it will do syscall. This is because in ARM64 the vdso doesn't have getcpu.
+///   And musl doesn't use rseq.
+/// - Some old versions of glibc does syscall
+/// - TODO
+#[cfg(target_os = "linux")]
+pub fn curr_shard_index() -> ShardIndex {
+    use std::ffi::c_int;
+
+    // Side note: rustix also has sched_getcpu but it uses syscall in aarch64 which is slow
+    let cpu_index: c_int = unsafe { libc::sched_getcpu() };
+    get_shard_count().modulo(cpu_index as usize)
+}
+
+// Windows -----
+
+/// In Windows, the current shard index is obtained by `GetCurrentProcessorNumber`
+///
+/// The Microsoft documentation doesn't mention whether `GetCurrentProcessorNumber` uses syscall. But according to [this blog](https://www.alex-ionescu.com/solution-to-challenge/) the reverse-engineered machine code contains no syscall in X86 (except WOW64, which only happens to 32-bit applications).
+/// So it should be fast enough. (Not sure in ARM.)
+#[cfg(target_os = "windows")]
+pub fn curr_shard_index() -> ShardIndex {
+    let cpu_index: u32 = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() };
+    get_shard_count().modulo(cpu_index as usize)
+}
+
+// Fallback (not Windows or Linux) -----
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+thread_local! {
+    static SHARD_INDEX_FROM_THREAD_ID_HASH: ShardIndex = shard_index_from_thread_id_hash();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn shard_index_from_thread_id_hash() -> ShardIndex {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let thread_id = thread::current().id();
+    let mut hasher = DefaultHasher::new();
+    thread_id.hash(&mut hasher);
+    let value: u64 = hasher.finish();
+
+    ShardIndex::from_u64(value)
+}
+
+/// In non-Linux non-Windows, use thread id hash for shard index.
+/// It will have more contention. Different threads' hash modulo shared count can be same.
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn curr_shard_index() -> ShardIndex {
+    SHARD_INDEX_FROM_THREAD_ID_HASH.with(|v| *v)
 }
