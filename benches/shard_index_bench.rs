@@ -1,6 +1,6 @@
 //! Benchmark for `curr_shard_index`, which gets the current CPU index
 //! (`sched_getcpu` on Linux, `GetCurrentProcessorNumber` on Windows,
-//! thread-id hash elsewhere) and maps it to a shard index.
+//! thread-id hash elsewhere and on musl aarch64) and maps it to a shard index.
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use sdarc::curr_shard_index;

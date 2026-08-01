@@ -10,9 +10,13 @@ use sdarc::sdarc::Sdarc;
 mod common;
 
 use common::{OPS_PER_THREAD, configure_criterion, parallelism, run_threads};
+use sdarc::get_shard_count;
+use sdarc::shard_index::DOES_SHARD_INDEX_USE_CPU_INDEX;
 
 fn bench_clone_drop_contention(c: &mut Criterion) {
     let num_threads = parallelism();
+
+    println!("Shard count {:?}. Uses CPU Index {}", get_shard_count(), DOES_SHARD_INDEX_USE_CPU_INDEX);
 
     // ---------- Sdarc ----------
     {

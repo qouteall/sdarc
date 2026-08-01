@@ -11,9 +11,12 @@ It doesn't check all counters after decrement. There is a background collector t
 
 ### Shard selection
 
-In Linux, it selects shard by libc `sched_getcpu` in each operation. In most cases `sched_getcpu` involve no syscall, so it should be fast enough. In Windows, it uses `GetCurrentProcessorNumber`. Using current CPU index can avoid contention.
+When cloning/dropping `Sdarc` it needs to select a shard using `curr_shard_index()`. The shard selection mechanism: 
 
-In non-Linux non-Windows, it uses thread id hash modulo shard count as shard index (cached in thread local). It will have more cache contention, because shard index is fixed per thread. Different threads may have same shard index.
+- In Linux, it selects shard by libc `sched_getcpu`. Normally `sched_getcpu` involves no syscall, so it's fast enough.
+  - Exception: musl in aarch64 uses syscall to implement `sched_getcpu`. Syscall is slow, so in musl aarch64 it uses the fallback case below. (This exception doesn't apply to musl in X86-64. musl in X86-64 uses vdso to implement `sched_getcpu` which doesn't involve syscall. This exception also does not apply when using glibc.)
+- In Windows, it selects shard by `GetCurrentProcessorNumber`. `GetCurrentProcessorNumber` also involves no syscall.
+- Fallback case. uses thread id hash modulo shard count as shard index (cached in thread local). It will have more cache contention, because shard index is fixed per thread. Different threads may have same shard index.
 
 ### API differences to `Arc`
 

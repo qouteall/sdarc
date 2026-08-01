@@ -613,6 +613,7 @@ version = "0.1.0"
 dependencies = [
  "append-only-vec",
  "arc-swap",
+ "cfg-if",
  "criterion",
  "crossbeam-utils",
  "libc",

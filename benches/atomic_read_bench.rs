@@ -10,16 +10,16 @@ use arc_swap::ArcSwap;
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use sdarc::atomic_sdarc::AtomicSdarc;
 use sdarc::sdarc::Sdarc;
-use sdarc::shard_index::get_shard_count;
+use sdarc::shard_index::{get_shard_count, DOES_SHARD_INDEX_USE_CPU_INDEX};
 
 mod common;
 
 use common::{OPS_PER_THREAD, configure_criterion, parallelism, run_threads};
 
 fn bench_atomic_read_throughput(c: &mut Criterion) {
-    println!("Shard count {:?}", get_shard_count());
+    println!("Shard count {:?}. Uses CPU Index {}", get_shard_count(), DOES_SHARD_INDEX_USE_CPU_INDEX);
 
-    assert!(membarrier2::is_supported());
+    println!("asymmetric fence supported {}", membarrier2::is_supported());
 
     let num_readers = parallelism();
     let payload = vec![0i64; 64];
