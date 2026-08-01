@@ -18,7 +18,7 @@ fn bench_clone_drop_contention(c: &mut Criterion) {
     {
         let shared = Sdarc::new(42i64);
 
-        c.bench_function("clone_drop Sdarc", |b| {
+        c.bench_function("clone_drop_multi_thread Sdarc", |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -42,7 +42,7 @@ fn bench_clone_drop_contention(c: &mut Criterion) {
     {
         let shared = Arc::new(42i64);
 
-        c.bench_function("clone_drop/Arc", |b| {
+        c.bench_function("clone_drop_multi_thread Arc", |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
