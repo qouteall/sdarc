@@ -37,7 +37,7 @@ The `WeakSdarc` is the weak reference version of `Sdarc`. Its weak reference beh
 
 Different counter shards of one `Sdarc` pointee are in different cache lines. But the different `Sdarc` pointees's counters in same shard can be put together to save memory usage. This library provides general sharded allocation functionality that allows allocating 8 bytes per shard (`ShardedBox`). 
 
-This library also supports `ShardedRwLock`.Reader acquire one sharded lock, writer acquire all locks, readers have low contention with readers. It's similar to crossbeam `ShardedLock`, but uses parking_lot rwlock and uses this library's sharded alloc.
+This library also supports `ShardedRwLock`. Reader acquire one sharded lock, writer acquire all locks, readers have low contention with readers. It's similar to crossbeam `ShardedLock`, but uses parking_lot rwlock and uses this library's sharded alloc.
 
 ### Is it GC?
 

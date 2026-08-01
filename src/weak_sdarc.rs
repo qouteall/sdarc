@@ -13,15 +13,15 @@ pub(crate) struct WeakSdarcInner<T> {
     ///
     /// Note: it's possible that a concurrent upgrade resurrects the SdarcInner whose strong count sum is 0.
     /// After resurrection, `Sdarc` can still downgrade.
-    /// The `WeakSdarc` may be unable to upgrade or may can upgrade after resurrection,
+    /// The `WeakSdarc` may or may not be able to upgrade after resurrection,
     /// depending on whether backref is cleared, which depends on collector timing.
     ///
     /// It's similar to [`crate::atomic_sdarc::AtomicNullableSdarc`], except that it doesn't own a reference count.
     back_ref: AtomicPtr<SdarcInner<T>>,
 }
 
-unsafe impl<T: Send> Send for WeakSdarcInner<T> {}
-unsafe impl<T: Sync> Sync for WeakSdarcInner<T> {}
+unsafe impl<T: Send + Sync> Send for WeakSdarcInner<T> {}
+unsafe impl<T: Send + Sync> Sync for WeakSdarcInner<T> {}
 
 impl<T> Drop for WeakSdarcInner<T> {
     fn drop(&mut self) {

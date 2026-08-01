@@ -39,8 +39,8 @@ pub struct AtomicNullableSdarc<T> {
     inner_ptr: AtomicPtr<SdarcInner<T>>,
 }
 
-unsafe impl<T: Send> Send for AtomicNullableSdarc<T> {}
-unsafe impl<T: Sync> Sync for AtomicNullableSdarc<T> {}
+unsafe impl<T: Send + Sync> Send for AtomicNullableSdarc<T> {}
+unsafe impl<T: Send + Sync> Sync for AtomicNullableSdarc<T> {}
 
 impl<T: Send + Sync> AtomicNullableSdarc<T> {
     pub const fn new() -> Self {
@@ -152,9 +152,9 @@ impl<T> AtomicNullableSdarc<T> {
     ///
     /// This is similar to arcshift.
     pub fn sync_to(&self, target: &mut Option<Sdarc<T>>) {
-        let targe_curr_ptr = Sdarc::nullable_get_raw_ptr(target);
+        let target_curr_ptr = Sdarc::nullable_get_raw_ptr(target);
         let curr_atomic_ptr = self.inner_ptr.load(Ordering::Relaxed);
-        if targe_curr_ptr != curr_atomic_ptr {
+        if target_curr_ptr != curr_atomic_ptr {
             *target = self.load_owned();
         }
     }
@@ -220,9 +220,9 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     ///
     /// This is similar to arcshift.
     pub fn sync_to(&self, target: &mut Sdarc<T>) {
-        let targe_curr_ptr = target.inner_ptr.as_ptr();
+        let target_curr_ptr = target.inner_ptr.as_ptr();
         let curr_atomic_ptr = self.0.inner_ptr.load(Ordering::Relaxed);
-        if targe_curr_ptr != curr_atomic_ptr {
+        if target_curr_ptr != curr_atomic_ptr {
             *target = self.load_owned();
         }
     }
@@ -237,7 +237,7 @@ const HZ_PTR_SLOT_COUNT: usize = 15;
 #[derive(Copy, Clone, Debug)]
 struct HzSlotIndex(u8);
 
-/// It's used for protecting the process between loading an atomic pointer and incrementing ref count.
+/// It's used for protecting the process from loading an atomic pointer to incrementing ref count.
 ///
 /// It can be seen as a special spinlock, except that reader thread never spins and directly acquires lock (always succeed),
 /// collector just keeps polling it until it's not locked.

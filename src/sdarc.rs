@@ -141,8 +141,8 @@ impl<T> Sdarc<T> {
     }
 }
 
-unsafe impl<T: Send> Send for Sdarc<T> {}
-unsafe impl<T: Sync> Sync for Sdarc<T> {}
+unsafe impl<T: Send + Sync> Send for Sdarc<T> {}
+unsafe impl<T: Send + Sync> Sync for Sdarc<T> {}
 
 // without these two, cargo doc will hang. probably a bug of rustdoc. https://github.com/rust-lang/rust/issues/160280
 impl<T: RefUnwindSafe> UnwindSafe for Sdarc<T> {}

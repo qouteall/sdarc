@@ -3,7 +3,7 @@ use std::ops::{Index, IndexMut};
 use std::sync::LazyLock;
 use std::thread;
 
-// Shard count is power of 2. Because that we need to frequently turn CPU index to shared index.
+// Shard count is power of 2. Because we need to frequently turn CPU index to shard index.
 // Computing modulo to non-constant non-power-of-2 is slow.
 #[derive(Copy, Clone, Debug)]
 pub struct ShardCount {
@@ -13,7 +13,7 @@ pub struct ShardCount {
 
 pub(crate) const MAX_SHARD_COUNT: usize = 256;
 
-const MIN_EXPONENT: u32 = 1;
+const MIN_EXPONENT: u32 = 0;
 const MAX_EXPONENT: u32 = 8;
 
 impl ShardCount {
@@ -82,7 +82,7 @@ impl ShardIndex {
         Self::from_usize(value as usize)
     }
 
-    pub fn as_8(self) -> u8 {
+    pub fn as_u8(self) -> u8 {
         self.0
     }
 
