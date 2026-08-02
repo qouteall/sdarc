@@ -1,44 +1,55 @@
-//! Why the tagged counter is introduced: solving a race condition of collector reading counters.
+//! The tagged counter is used for solving race condition of collector reading counters.
 //!
-//! In Sdarc, each thread only increment/decrement counters in one shard.
+//! In Sdarc, each ref count increment/decrement can work on different shards.
 //! One counter slot can go negative. It should be freed when counter sum goes 0.
 //! However, there is no instruction to read all sharded counters at the same time atomically.
 //! So the collector has to read counters one-by-one. Then there is chance of race condition.
 //!
 //! For example, assume there are two shards. Firstly counters are [0, 1]:
 //! - Collector reads first counter, get 0
-//! - A thread in first shard clones Sdarc, now counters are [1, 1]
-//! - A thread in second shard drops Sdarc, now counters are [1, 0]
+//! - The `Sdarc` clones, increments second shard, now counters are [1, 1]
+//! - A `Sdarc` drops, decrements first shard, now counters are [1, 0]
 //! - Collector reads second counter, get 0
 //! - Collector observed that the sum of counters is 0, but it's actually not zero. At that time, freeing is wrong.
 //!
-//! What if the collector reads the counters for two times? But the same thing can happen for two times, just with lower probability. Even if collector reads counters for one thousand times, it's still potentially unsafe. This interleave is valid even if all counter accesses use SeqCst memory ordering.
+//! What if the collector reads the counters for two times? But the same thing can happen for two times, just with lower probability. Even if collector reads counters for one thousand times, it's still potentially unsafe, and it's inefficient.
 //!
-//! It's solvable by making decrementing use locking. But locking may defeat the performance gain.
+//! Also, making all counter accesses SeqCst doesn't solve it. This interleave is valid even if all counter accesses use SeqCst memory ordering.
 //!
-//! This library solves it using tagged counter.
+//! It's solvable by using locking, but we want to make ref count increment/decrements lock-free to improve performance.
+//!
+//! This library's solution is tagged counter.
 //!
 //! A tagged counter is a 64-bit signed integer. The higher 63 bits is treated as reference count. The last bit is for tagging.
 //! - Incrementing counter increments it by 2. (For the higher 63 bits, it increments by 1.)
-//! - Decrementing counter decrements it by 2, and also set the last bit to 1. (For the higher 63 bits, it decrements by 1.) It happens atomically using compare_exchange_weak.
+//! - Decrementing counter decrements it by 2, and also set the last bit to 1. (For the higher 63 bits, it decrements by 1.) It happens atomically using `compare_exchange_weak`. (It also works the same for negative integers)
 //!
 //! When collector observes that ref counter sum is 0, it doesn't immediately free memory.
 //! It atomically clears each counter's tag (set last bit to 0).
-//! Then after some time it reads the counters again. If the reference count sum is still 0 and all tags are still 0, it means the counters haven't been decremented (given counter sum is still 0, it also haven't incremented).
+//! Then re-check the sum.
+//! Then after some time it reads the counters again.
+//! If the reference count sum is still 0 and all tags are still 0,
+//! it means the counters haven't been decremented (given counter sum is still 0, it also haven't incremented).
 //! Then it's safe to drop inner content.
 //!
 //! If the previously mentioned race condition happens,
 //! one tag will be set, which can be observed by collector.
 //!
-//! The increment of counter uses Relaxed ordering. Because increment can only happen when an instance
-//! of Sdarc is live, which means counter sum is at least 1. Collector delaying observing the increment is fine,
-//! as long decrement is not visible before increment. Decrement uses Release which ensures that if the
-//! decrement is observed, the previous increments in same thread is also observable. For cross-thread case (increment
-//! in one thread, send to another thread to decrement), other synchronizations have established that incrementing counter inter-thread happens-before decrementing counter. (Even if increment is visible to collector before decrement, the collector's non-atomic way of reading counters can still cause race condition described above, which is solved by tagging.)
+//! The increment of counter uses Relaxed ordering. The reason is similar to std Arc.
+//! Increment can only happen when an instance
+//! of Sdarc is live, which means counter sum is at least 1.
+//! Collector delaying observing the increment is fine,
+//! as long as decrement is not visible before increment.
 //!
-//! The decrement and setting of bit use Release ordering. Collector reads counter using Acquire ordering.
-//! (Collector firstly do pre-scan using Relaxed ordering, which is an optimization that doesn't affect ordering.)
-//! If collector hasn't observed the decrement, then it's safe because reference count sum cannot be 0 before observing decrement. If the collector have observed the decrement, then collector can observe the tag being set then will delay collecting, so it's also safe.
+//! In some platforms, the shard index is determined by current CPU index, which is non-deterministic.
+//! So a thread could first increment one shard then decrement another shard.
+//! The Release-Acquire ordering ensures that when collector observes the decrement,
+//! all changes made by the thread that does the Release decrement is visible to collector,
+//! even it's another shard. Collector uses Acquire read to all counter shards.
+//!
+//! For cross-thread case
+//! (increment in one thread, send to another thread to decrement),
+//! other synchronizations have established that incrementing counter happens-before decrementing counter.
 //!
 //! About overflow/underflow: the max reference count (higher 63 bit) is 2^62-1, min is -2^62. In ideal case, a fast uncontended atomic takes 3 cycles for 1 increment, given 4GHz frequency, overflowing/underflowing it takes about 110 years. If there is contention, incr/decr will be slower. So no need to care about overflow/underflow.
 //!

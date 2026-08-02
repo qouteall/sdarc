@@ -1,17 +1,27 @@
 //! Atomic Sdarc pointers.
 //!
-//! Note that it uses the asymmetric fence https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p1202r4.pdf
-//! via membarrier2 crate.
+//! For usage, see [`AtomicSdarc`] and [`AtomicNullableSdarc`].
+//!
+//! The below is implementation explanation.
+//!
+//! # Implementation explanation
+//!
+//! It uses the [asymmetric fence](https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2022/p1202r4.pdf)
+//! via [membarrier2](https://docs.rs/membarrier2/latest/membarrier2/) crate.
 //!
 //! Summarize asymmetric fence:
+//!
 //! - Light fence is just compiler fence that prevents instruction reordering.
-//! - Heavy fence uses OS API that sends interrupt to every core executing current process's thread
+//! - Heavy fence uses OS API that sends interrupt to every core executing current process's thread.
 //! - The SeqCst operation implicitly includes a compiler fence. SeqCst operation "contains" light fence.
 //! - A light fence sync with heavy fence similar to SeqCst. However, the light fences don't sync with each other.
 //!   The light fences can have indirect ordering via the heavy fence.
 //! - The asymmetric fence is not yet included in C++ memory model (that Rust uses).
+//!   Here the light fence and heavy fence will be treated as SeqCst fence but only works between the two threads,
+//!   one using heavy fence and another using light fence.
 //!
 //! The safety relies on:
+//!
 //! - The collector takes two iterations observing zero ref count sum to free one object.
 //! - The collector will run a `membarrier2::heavy()` before each iteration, then read hazard pointers,
 //!   and spin until observing reader critical section in inactive state once.
@@ -21,9 +31,196 @@
 //! Hazard pointer prevents collector from collecting it. It's a way to keep pointee alive even
 //! when reference count sum is 0.
 //!
-//! When current thread's hazard pointer slots are full,
-//! it will fallback to reader critical section.
-
+//! ## Safety and memory ordering of reader critical section
+//!
+//! The reader critical section is used for protecting [`AtomicNullableSdarc::load_owned`].
+//! The `load_owned` reads atomic pointer then increments ref count of one shard.
+//! The problem is that right after loading pointer and before incrementing ref count,
+//! the object could be freed, then incrementing ref count is use-after-free.
+//! The reader critical section prevents that problem.
+//!
+//! There is [`PerThreadReaderCriticalSectionFlag`]. It will be used by reader and collector, but not writer.
+//! Changing atomic pointer doesn't do any special synchronization with collector or reader.
+//!
+//! There are two ways to view the critical section flag:
+//!
+//! - It can be seen as a special spinlock, except that reader thread never spins
+//!   and directly acquires lock (always succeed),
+//!   collector just keeps polling it until it's not locked.
+//! - It can also be seen as a "universal" hazard pointer that correspond to any data managed by Sdarc.
+//!
+//! Reader thread:
+//! 1. set critical section flag to true, Relaxed
+//! 2. light barrier
+//! 3. load atomic pointer, Acquire
+//!
+//!    (Reader thread can be un-scheduled here)
+//!
+//! 4. increment ref count, Relaxed
+//! 5. set critical section flag to false, Release
+//!
+//! Writer thread:
+//! 1. swap atomic pointer, SeqCst
+//! 2. decrement ref count of original object, Release
+//!
+//! Collector thread:
+//! 1. heavy barrier
+//! 2. for each thread's critical section flag, poll using Acquire until observing false
+//! 3. read counter sum in Acquire ordering. if 0, clear tags (there is a relaxed pre-read before, doesn't matter in ordering)
+//! 4. in next collector inner iteration, heavy barrier again, poll until observing false again
+//! 5. read counter sum in Acquire ordering, if it stays 0 and no tag is observed, free the memory
+//! (assume that no weak ref is involved. if weak ref is involved there is one extra iteration)
+//!
+//! Normally if reader is unscheduled between 3 and 4, collector will be polling, until reader exits critical section.
+//!
+//! Is it safe when right after collector finishes polling reader sets flag to true?
+//! If reader sets flag after collector's first iteration's polling,
+//! it's still safe because it requires two collector iterations to free one object.
+//! What if reader sets flag after collector's second iteration then reads a pointer that's about to be freed?
+//! It's still safe, explained below.
+//!
+//! Consider this extreme case:
+//!
+//! - Writer swaps pointer and decrement reference count.
+//! - Collector does first iteration, observe reference count sum is 0, clear tags
+//! - Collector runs second iteration, and reader starts reading in parallel
+//!
+//! The collector's second iteration's heavy barrier CH2 has a total order with reader's light barrier RL.
+//! There are two cases:
+//!
+//! 1. RL is before CH2. Reader's setting of critical section flag happens-before RL,
+//!    RL happens-before CH2, CH2 happens-before collector's reading of critical section flag.
+//!    So flag being true is visible to collector.
+//!    Even if reader loads a stale pointer, collector's observing of flag being true blocks collection,
+//!    so the stale pointer cannot be freed.
+//!    When collector observes flag being false, the reader's increment is sequenced-before setting flag to false
+//!    in Release, so collector observing flag being false using Acquire is able
+//!    to observe incremented ref count later. Even if reader reads a stale pointer, collector can observe the
+//!    incremented ref count. So it's safe.
+//!
+//! 2. CH2 is before RL. Consider that in previous iteration collector has observed zero ref count sum using Acquire,
+//!    and writer's decrementing of ref count uses Release, and writer's swapping of pointer is sequenced-before
+//!    decrementing ref count,
+//!    so the swapping pointer happens-before collector's counter read in first iteration, which happens-before CH2.
+//!    Now RL is after CH, so the swapped pointer should also
+//!    be observable to reader. Reader won't read the stale pointer that is about to be freed.
+//!
+//! But consider that start from C++20, the SeqCst total order is no longer required
+//! to be consistent with happens-before.
+//! Is it possible that the inconsistency between SeqCst total order and happens-before causes
+//! previous reasoning to be flawed?
+//!
+//! First of all, SeqCst contains Release-Acquire. In the previous first case (RL is before CH2),
+//! the reasoning holds using only happens-before relation. So the first case is ok.
+//!
+//! The second case (CH2 is before RL) is more complex. The reader cannot read
+//! the stale pointer that's about to be freed.
+//! But it cannot be ensured by just Release-Acquire ordering.
+//! Reader uses Acquire to load pointer, and writer uses SeqCst to swap.
+//! There is Release-Acquire ordering that ensures reader doesn't read uninitialized data,
+//! but doesn't ensure reader don't read a stale pointer that's about to be freed.
+//! And the reader's light fence doesn't sync with writer's SeqCst swap.
+//! This is a complex case that involves interaction with SeqCst and Release-Acquire.
+//!
+//! C++26 memory model has this definition of strongly happens-before:
+//!
+//! > Regardless of threads, evaluation A strongly happens-before evaluation B if any of the following is true:
+//! >
+//! > (1) A is sequenced-before B.
+//! >
+//! > (2) A synchronizes with B, and both A and B are sequentially consistent atomic operations.
+//! >
+//! > (3) A is sequenced-before X, X happens-before Y, and Y is sequenced-before B.
+//! >
+//! > (4) A strongly happens-before X, and X strongly happens-before B.
+//!
+//! In the second case (CH2 is before RL), the whole visibility chain is:
+//!   1. Writer swaps atomic pointer, SeqCst
+//!   2. Writer decrements ref count of old object, Release (sequenced-after 1)
+//!   3. Collector read ref count sum and get 0, Acquire (synchronizes-with 2)
+//!   4. Collector second iteration heavy fence CH2 (sequenced-after 3)
+//!   5. Reader light fence RL (sync between heavy fence and light fence, after 4)
+//!   6. Reader read atomic pointer, Acquire (sequenced-after 5)
+//!
+//! Then:
+//! - 1 sequenced-before 2, 2 happens-before 3, 3 sequenced-before 4, so 1 strongly happens-before 4, according to (3).
+//! - due to CH2 before RL, 4 strongly happens-before 5, according to (2)
+//! - 5 is sequenced-before 6, so 5 strongly happens-before 6, according to (1)
+//! - based the above three results, 1 strongly happens-before 6, according to (4)
+//!
+//! The strongly happens-before will be consistent with both Release-Acquire and SeqCst.
+//! So in that case reader cannot read a stale pointer that's about to be freed.
+//! The is ensured by reader syncing with collector and collector syncing with writer.
+//! Safe.
+//!
+//! ## Safety and memory ordering of hazard pointer
+//!
+//! The `load_owned` is already kind of fast. But it uses two atomic read-modify-write operations.
+//! For short-term reads it's not fast enough. So there is hazard pointer mechanism.
+//!
+//! Hazard pointer mechanism allows a `Sdarc` pointee to be alive even if ref count sum becomes 0.
+//! Each thread has fixed amount of hazard pointer slots. When slots are full,
+//! it falls back to `load_owned`.
+//! Also when the re-loaded pointer is different to pre-loaded pointer it also falls back to `load_owned`.
+//! The hazard pointer borrower doesn't do retry. This gives an upper bound of instruction count required to
+//! start borrowing hazard pointer
+//! (instruction count is bounded, but time doesn't necessarily bound as OS scheduling is non-deterministic).
+//!
+//! Reader:
+//! 1. load atomic ptr, Relaxed
+//!
+//!    (reader can be un-scheduled here)
+//!
+//! 2. publish hazard pointer, Relaxed
+//!    (hazard pointer may be dangling at this time, but collector doesn't dereference hazard pointer so it's fine)
+//! 3. light fence
+//! 4. re-load atomic ptr, Acquire
+//! 5. if two pointers equal, borrowing succeeded
+//! 6. use the borrowed data
+//! 7. when borrowing finishes, clear hazard pointer in Release
+//!
+//! Writer:
+//! 1. swap atomic ptr, SeqCst
+//! 2. decrement ref count of original object, Release
+//!
+//! Collector:
+//! 1. in beginning of first iteration, heavy barrier (CH1)
+//! 2. read hazard pointers, Acquire
+//! 3. for a non-hazard `SdarcInner`, read reference count in Acquire
+//!    (there is a Relaxed pre-read but doesn't matter in ordering)
+//! 4. in beginning of second iteration, heavy barrier (CH2)
+//! 5. read hazard pointers, Acquire
+//! 6. re-check ref count for non-hazard `SdarcInner`s
+//! 7. if ref count sum keeps being 0, and no tag is observed,
+//!    and observed none of its hazard pointer in two iterations, free pointee
+//!
+//! Is it still safe when reader publishes hazard pointer right after collector finish checking hazard pointers in first iteration?
+//! Yes because it requires two collector iterations to free one object.
+//!
+//! Reader light barrier doesn't sync with writer SeqCst write. Is it still safe when reader reads stale pointer?
+//! Consider this extreme case:
+//!
+//! - Writer swap atomic pointer and decrement ref count of original object.
+//! - Collector finishes first iteration, observed original object's zero ref count sum.
+//! - Reader loads stale pointer. The collector second iteration runs in parallel.
+//!
+//! The reader's light fence Rl has total order with collector's second iteration heavy barrier CH2.
+//! Similarly, there are two cases:
+//!
+//! - RL is before CH2. Then the writing of hazard pointer happens-before collector's reading of hazard pointer.
+//!   Collector will observe the hazard pointer. Safe.
+//! - CH2 is before RL. When collector observes zero ref count sum in first iteration using Acquire ordering,
+//!   the changed atomic pointer should be visible to collector. The RL being after CH makes the changed atomic
+//!   pointer visible to reader. Then re-read reads a different pointer, hazard pointer borrow failed. Safe.
+//!   (It mixes SeqCst and Release-Acquire but still ensures reader observe new atomic pointer,
+//!   similar to the previous reasoning of reader critical section.)
+//!
+//! What if right after the pre-read, the reader thread is unscheduled, then the pointee freed,
+//! then another object coincidentally allocated with the same pointer, then that pointer
+//! is stored to the atomic pointer? It's ok because the type system ensures
+//! that two different objects' types are the same. The hazard borrowing succeeds on the new object.
+//! In this case Miri consider the two equal pointers to have different provenance. The code
+//! uses re-loaded pointer to start borrowing which carries the new provenance.
 use crate::sdarc::{Sdarc, SdarcInner, SdarcInnerPtrErased};
 use append_only_vec::AppendOnlyVec;
 use crossbeam_utils::CachePadded;
@@ -35,6 +232,10 @@ use std::ptr::{NonNull, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::{array, hint};
 
+/// The atomic nullable `Sdarc` pointer.
+///
+/// It provides shallow interior mutability.
+/// The pointer can be changed using immutable borrow.
 pub struct AtomicNullableSdarc<T> {
     inner_ptr: AtomicPtr<SdarcInner<T>>,
 }
@@ -67,6 +268,8 @@ impl<T> AtomicNullableSdarc<T> {
     ///
     /// If you just want to do short-term read, it's recommended to use [`AtomicNullableSdarc::borrow`] which
     /// can be faster (it uses hazard pointer, requiring no atomic read-modify-write operation in happy path).
+    ///
+    /// About implementation: [`PerThreadReaderCriticalSectionFlag`]
     pub fn load_owned(&self) -> Option<Sdarc<T>> {
         load_atomic_ptr_owned(&self.inner_ptr)
     }
@@ -116,8 +319,9 @@ impl<T> AtomicNullableSdarc<T> {
             Ok(original_ptr) => {
                 assert_eq!(original_ptr, if_matches_ptr);
 
-                // Setting succeeded, but the `then_set_ptr` comes from a borrowed Sdarc. There is no Sdarc ownership transfer.
-                // We need to increment counter to compensate.
+                // Setting succeeded, but the `then_set_ptr` comes from a borrowed Sdarc.
+                // There is no Sdarc ownership transfer,
+                // so we need to increment counter to compensate.
                 // No need to use critical section here, because at this time at least one strong reference of `then_set` exists.
                 if let Some(then_set_inner) = unsafe { then_set_ptr.as_ref() } {
                     then_set_inner
@@ -141,6 +345,8 @@ impl<T> AtomicNullableSdarc<T> {
     /// The guard can keep the Sdarc pointee alive even when its reference count sum reach zero.
     ///
     /// It returns None if the loaded pointer is null.
+    ///
+    /// About implementation: [`try_borrow_from_atomic_ptr_using_hazard_pointer`]
     #[allow(clippy::needless_lifetimes)]
     pub fn borrow<'a>(&'a self) -> Option<AtomicSdarcBorrowGuard<'a, T>> {
         borrow_from_atomic_ptr(&self.inner_ptr)
@@ -149,8 +355,6 @@ impl<T> AtomicNullableSdarc<T> {
     /// The `borrow` is fast enough for reader. But if you want faster read that avoids hazard pointer cost,
     /// you can keep a local (per-thread) `Sdarc<T>`, then periodically sync the atomic pointer to local `Sdarc<T>`.
     /// If the atomic pointer doesn't change, the sync involves almost no cost.
-    ///
-    /// This is similar to arcshift.
     pub fn sync_to(&self, target: &mut Option<Sdarc<T>>) {
         let target_curr_ptr = Sdarc::nullable_get_raw_ptr(target);
         let curr_atomic_ptr = self.inner_ptr.load(Ordering::Relaxed);
@@ -166,6 +370,10 @@ impl<T> Drop for AtomicNullableSdarc<T> {
     }
 }
 
+/// The atomic `Sdarc` pointer.
+///
+/// It provides shallow interior mutability.
+/// The pointer can be changed using immutable borrow.
 pub struct AtomicSdarc<T>(AtomicNullableSdarc<T>);
 
 impl<T: Send + Sync> AtomicSdarc<T> {
@@ -177,6 +385,8 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     ///
     /// If you just want to do short-term read, it's recommended to use [`AtomicSdarc::borrow`] which
     /// can be faster (it uses hazard pointer, requiring no atomic read-modify-write operation in happy path).
+    ///
+    /// About implementation: [`PerThreadReaderCriticalSectionFlag`]
     pub fn load_owned(&self) -> Sdarc<T> {
         self.0.load_owned().unwrap()
     }
@@ -209,6 +419,14 @@ impl<T: Send + Sync> AtomicSdarc<T> {
         }
     }
 
+    /// Borrow from the atomic pointer.
+    /// The inner object will be kept alive using hazard pointer mechanism.
+    /// The borrow stays valid as long as the guard object is live.
+    /// After the atomic pointer changes, the existing guard still borrows the previous pointee.
+    ///
+    /// The guard can keep the Sdarc pointee alive even when its reference count sum reach zero.
+    ///
+    /// About implementation: [`try_borrow_from_atomic_ptr_using_hazard_pointer`]
     #[allow(clippy::needless_lifetimes)]
     pub fn borrow<'a>(&'a self) -> AtomicSdarcBorrowGuard<'a, T> {
         self.0.borrow().unwrap()
@@ -217,8 +435,6 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     /// The `borrow` is fast enough for reader. But if you want faster read that avoids hazard pointer cost,
     /// you can keep a local (per-thread) `Sdarc<T>`, then periodically sync the atomic pointer to local `Sdarc<T>`.
     /// If the atomic pointer doesn't change, the sync involves almost no cost.
-    ///
-    /// This is similar to arcshift.
     pub fn sync_to(&self, target: &mut Sdarc<T>) {
         let target_curr_ptr = target.inner_ptr.as_ptr();
         let curr_atomic_ptr = self.0.inner_ptr.load(Ordering::Relaxed);
@@ -237,55 +453,6 @@ const HZ_PTR_SLOT_COUNT: usize = 15;
 #[derive(Copy, Clone, Debug)]
 struct HzSlotIndex(u8);
 
-/// It's used for protecting the process from loading an atomic pointer to incrementing ref count.
-///
-/// It can be seen as a special spinlock, except that reader thread never spins and directly acquires lock (always succeed),
-/// collector just keeps polling it until it's not locked.
-///
-/// It can also be seen as a "universal" hazard pointer that correspond to any data managed by Sdarc.
-///
-/// Reader thread:
-/// 1. set critical section flag to true, Relaxed
-/// 2. light barrier
-/// 3. load atomic pointer
-///    (Assume that Reader thread can be un-scheduled here)
-/// 4. increment ref count
-/// 5. set critical section flag to false, Release
-///
-/// Writer thread:
-/// 1. swap atomic pointer, SeqCst
-/// 2. decrement ref count of original object, Release
-///
-/// Collector thread:
-/// 1. heavy barrier
-/// 2. for each thread's critical section flag, poll using Acquire until observing false
-/// 3. read counter sum in Acquire ordering. if it stays 0, clear tags (there is a relaxed pre-read before, doesn't matter in ordering)
-/// 4. in next collector inner iteration, heavy barrier again, poll until observing false again
-/// 5. read counter sum in Acquire ordering, if it stays 0 and no tag is observed, free the memory
-///
-/// Normally if reader is unscheduled between 3 and 4, collector will be polling, until reader exits critical section.
-///
-/// Is it safe when right after collector finishes polling reader sets flag to true? Yes because it requires two
-/// collector iterations to free one object.
-///
-/// But the light barrier doesn't sync with writer's SeqCst write. Is it still safe when reader reads a stale pointer?
-///
-/// Consider this extreme case:
-///
-/// - Writer swaps pointer and decrement reference count.
-/// - Collector does first iteration, observe reference count sum is 0, clear tags
-/// - Collector runs second iteration, and reader starts reading in parallel
-///
-/// The collector's second iteration's heavy barrier CH has a total order with reader's light barrier RL.
-/// There are two cases:
-/// - RL is before CH. Then reader's setting of critical section flag will be observable to collector.
-///   When collector observes flag being false, the Acquire-Release ordering make collector be able
-///   to observe incremented ref count. Even if reader reads a stale pointer, collector can observe the
-///   incremented ref count so it's safe.
-/// - CH is before RL. Consider that in previous iteration collector has observed zero ref count sum using Acquire,
-///   and writer's decrementing of ref count uses Release, and writer's swapping of pointer is before decrementing ref
-///   count, so the swapped pointer was observable to collector. Now RL is after CH, so the swapped pointer should also
-///   be observable to reader. Reader won't read the stale pointer that is about to be freed.
 pub(crate) struct PerThreadReaderCriticalSectionFlag(AtomicBool);
 
 impl PerThreadReaderCriticalSectionFlag {
@@ -530,47 +697,6 @@ pub(crate) enum HazardBorrowErr {
     PointerChanged,
 }
 
-/// Borrow content from an atomic sdarc using hazard pointer, without incrementing ref count.
-/// It uses asymmetric fence to make reader fast.
-///
-/// Reader:
-/// 1. load atomic ptr, Relaxed
-///    (reader can be un-scheduled here)
-/// 2. publish hazard pointer, Relaxed
-/// 3. light fence
-/// 4. re-load atomic ptr, Acquire
-/// 5. if two pointers equal, borrowing succeeded
-/// 6. (after borrowing finishes, clear hazard pointer in Release)
-///
-/// Writer:
-/// 1. swap atomic ptr, SeqCst
-/// 2. decrement ref count of original object, Release
-///
-/// Collector:
-/// 1. in beginning of first iteration, heavy barrier
-/// 2. read hazard pointers, Acquire
-/// 3. for a non-hazard `SdarcInner`, read reference count, if observe zero sum, clear tags, read ref count using Acquire
-/// 4. in beginning of second iteration, heavy barrier
-/// 5. read hazard pointers, Acquire
-/// 6. re-check ref count for non-hazard `SdarcInner`s
-///
-/// Is it still safe when reader publishes hazard pointer right after collector finish checking hazard pointers?
-/// Yes because it requires two collector iterations to free one object.
-///
-/// Reader light barrier doesn't sync with writer SeqCst write. Is it still safe when reader reads stale pointer?
-/// Consider this extreme case:
-///
-/// - Writer swap atomic pointer and decrement ref count of original object.
-/// - Collector finishes first iteration, observed original object's zero ref count sum.
-/// - Reader loads stale pointer. The collector second iteration runs in parallel.
-///
-/// The reader's light fence Rl has total order with collector's second iteration heavy barrier CH.
-/// There are two cases:
-/// - RL is before CH. Then the published stale hazard pointer is visible to collector. Collector won't free
-///   original object in second iteration. Safe.
-/// - CH is before RL. When collector observes zero ref count sum in first iteration using Acquire ordering,
-///   the changed atomic pointer should be visible to collector. The RL being after CH makes the changed atomic
-///   pointer visible to reader. Then re-read reads a different pointer, hazard pointer borrow failed. Safe.
 #[allow(clippy::needless_lifetimes)]
 pub(crate) fn try_borrow_from_atomic_ptr_using_hazard_pointer<'a, T>(
     atomic_ptr: &'a AtomicPtr<SdarcInner<T>>,
@@ -665,6 +791,7 @@ fn unpublish_hazard_pointer_on_borrow_finish<T>(
     shared.store_release(index, null_mut());
 }
 
+/// See also [`PerThreadReaderCriticalSectionFlag`]
 pub(crate) fn load_atomic_ptr_owned<T>(atomic_ptr: &AtomicPtr<SdarcInner<T>>) -> Option<Sdarc<T>> {
     let shared = curr_thread_shared_hazard_data();
 

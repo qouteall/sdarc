@@ -81,4 +81,4 @@ targets = [
     "x86_64-pc-windows-msvc",
 ]
 
-rustdoc-args = ["--document-private-items"]
+#rustdoc-args = ["--document-private-items"]

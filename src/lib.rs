@@ -9,7 +9,9 @@ pub mod sdarc;
 pub mod atomic_sdarc;
 pub mod weak_sdarc;
 
-pub(crate) mod tagged_counter;
+// it has no public thing, pub mod for documentation
+pub mod tagged_counter;
+
 pub(crate) mod env_params;
 
 pub use sdarc::Sdarc;
