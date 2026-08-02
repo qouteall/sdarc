@@ -56,6 +56,11 @@ This library doesn't suit these use cases:
 - For millions of small objects, don't use `Sdarc`. It's recommended to put them into an arena. The arena can be held in `Sdarc`.
 - This library doesn't support no_std.
 
+### Env vars
+
+- `RUST_SDARC_COLLECTOR_INTERVAL_MS`. By default, collector runs once every 500ms. If one `Sdarc` pointee ref count goes 0, it takes two collector iterations to free memory (if `WeakSdarc` is involved, 3 iterations). If you want faster collection, this can be specified to smaller than 500. But don't make it too small. Making it too small will make collector consume more CPU time. Also, each collector iteration uses heavy barrier which sends interrupt to all cores running current process's thread (the heavy barrier is for synchronization with atomic Sdarc). Calling `collector_update_now_and_wait` can make collector collect early, without needing to setting this env var.
+- `RUST_SDARC_SHARD_COUNT`. By default, shard count is available parallelism, round up to power of 2. Setting this env var can control shard count. The actual shard count will be rounded up to power of 2.
+
 ### Appendix
 
 #### Comparison with Linux percpu-refcount:

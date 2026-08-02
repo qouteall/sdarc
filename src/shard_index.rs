@@ -177,12 +177,6 @@ cfg_if::cfg_if! {
 
         pub const DOES_SHARD_INDEX_USE_CPU_INDEX: bool = true;
     } else {
-        // Fallback: thread id hash. Used on non-Linux non-Windows platforms,
-        // and on musl aarch64 where `sched_getcpu` does a real syscall (slow).
-        //
-        // It will have more contention. The shard index is fixed per thread,
-        // and different threads' hash modulo shard count may be same.
-
         thread_local! {
             static SHARD_INDEX_FROM_THREAD_ID_HASH: ShardIndex = shard_index_from_thread_id_hash();
         }
@@ -198,6 +192,23 @@ cfg_if::cfg_if! {
             ShardIndex::from_u64(value)
         }
 
+        /// Fallback case: use thread id hash modulo shard count as shard index. Cached in thread local.
+        ///
+        /// Used on non-Linux non-Windows platforms,
+        /// and on musl aarch64 Linux (because musl in aarch64 does syscall in `sched_getcpu`, which is slow).
+        ///
+        /// It will have more contention. The shard index is fixed per thread,
+        /// and different threads' hash modulo shard count may be same.
+        ///
+        /// If there are T threads running and S shards,
+        /// assume that each thread's shard index is random,
+        /// probability that one thread doesn't contend one shard with another thread is: ((S-1)/S)\^(T-1)
+        ///
+        /// The expected number of threads that doesn't contend shard is: T \* ((S-1)/S)\^(T-1)
+        ///
+        /// Specifically, when there are 32 shards and 32 threads, about 12 threads won't contend, about 20 threads will contend.
+        /// Note that it's a theoretical estimation. In real-world workloads it won't just do
+        /// counter increment/decrement.
         pub fn curr_shard_index() -> ShardIndex {
             SHARD_INDEX_FROM_THREAD_ID_HASH.with(|v| *v)
         }

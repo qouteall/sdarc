@@ -80,3 +80,5 @@ targets = [
     "aarch64-unknown-linux-musl",
     "x86_64-pc-windows-msvc",
 ]
+
+rustdoc-args = ["--document-private-items"]
