@@ -41,9 +41,9 @@ windows-sys = { version =  "0.61", features = ["Win32_System_Threading"] }
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(miri)"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 arc-swap = "1"
-serial_test = "3"
+serial_test = "4"
 
 [[bench]]
 name = "collector_bench"
