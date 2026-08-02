@@ -18,6 +18,8 @@ When cloning/dropping `Sdarc` it needs to select a shard using `curr_shard_index
 - In Windows, it selects shard by `GetCurrentProcessorNumber`. `GetCurrentProcessorNumber` also involves no syscall.
 - Fallback case. uses thread id hash modulo shard count as shard index (cached in thread local). It will have more cache contention, because shard index is fixed per thread. Different threads may have same shard index.
 
+If constant `DOES_SHARD_INDEX_USE_CPU_INDEX` is false, then it uses fallback case. If true, then it uses CPU index.
+
 ### API differences to `Arc`
 
 The API of `Sdarc` is similar to `Arc`. Some differences:

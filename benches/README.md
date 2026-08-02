@@ -41,6 +41,27 @@ curr_shard_index        time:   [4.1541 ns 4.1555 ns 4.1567 ns]
 
 ---
 
+Same as the above, but uses musl instead of glibc, aarch64-unknown-linux-musl
+
+(in musl aarch64, `sched_getcpu` uses syscall, so shard index is based on thread id hash. there will be more contention)
+
+```
+AtomicSdarc load_owned  time:   [9.8068 ms 9.8782 ms 9.9552 ms]
+AtomicSdarc borrow      time:   [1.9748 ms 1.9784 ms 1.9818 ms]
+ArcSwap load            time:   [2.6258 ms 2.6330 ms 2.6402 ms]
+clone_drop_multi_thread Sdarc
+                        time:   [8.6571 ms 8.7253 ms 8.8006 ms]
+clone_drop_multi_thread Arc
+                        time:   [35.177 ms 35.281 ms 35.395 ms]
+clone_drop_single_thread Sdarc
+                        time:   [781.66 µs 781.84 µs 782.00 µs]
+clone_drop_single_thread Arc
+                        time:   [573.80 µs 573.81 µs 573.82 µs]
+curr_shard_index        time:   [1.7994 ns 1.7995 ns 1.7995 ns]
+```
+
+---
+
 On AMD Ryzen 9 9900X, 12 cores, 24 threads, Windows 11 rustc 1.97.1 (8bab26f4f 2026-07-14), x86_64-pc-windows-msvc:
 
 ```
