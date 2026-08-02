@@ -1,6 +1,8 @@
 ## 0.2.0
 
 - Add `estimate_strong_count`, `estimate_weak_count`
+- Add `WeakSdarc::ptr_eq`
+- Add some trait impls
 
 ## 0.1.1
 

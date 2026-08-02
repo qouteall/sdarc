@@ -5,7 +5,8 @@ use crate::sharded_alloc::{ShardedBox, ShardedDataPtr};
 use crate::tagged_counter::AtomicTaggedCounter;
 use crate::weak_sdarc::{ClearWeakBackRefResult, WeakSdarcInner, clear_weak_backref_impl};
 use std::any::type_name;
-use std::fmt::{Debug, Display, Formatter};
+use std::borrow::Borrow;
+use std::fmt::{Debug, Display, Formatter, Pointer};
 use std::hash::Hash;
 use std::mem;
 use std::mem::offset_of;
@@ -76,6 +77,7 @@ impl<T> Sdarc<T> {
         }
     }
 
+    /// Whether two `Sdarc`s point to same pointee.
     pub fn ptr_eq(a: &Sdarc<T>, b: &Sdarc<T>) -> bool {
         a.inner_ptr == b.inner_ptr
     }
@@ -132,6 +134,26 @@ impl<T> Deref for Sdarc<T> {
         &self.inner_ref().data
     }
 }
+
+impl<T> Borrow<T> for Sdarc<T> {
+    fn borrow(&self) -> &T {
+        self.deref()
+    }
+}
+
+impl<T> AsRef<T> for Sdarc<T> {
+    fn as_ref(&self) -> &T {
+        self.deref()
+    }
+}
+
+impl<T> Pointer for Sdarc<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Pointer::fmt(&self.deref(), f)
+    }
+}
+
+impl<T> Unpin for Sdarc<T> {}
 
 impl<T> Sdarc<T> {
     pub(crate) fn inner_ref(&self) -> &SdarcInner<T> {

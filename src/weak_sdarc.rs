@@ -122,6 +122,15 @@ impl<T> Clone for WeakSdarc<T> {
     }
 }
 
+impl<T> WeakSdarc<T> {
+    /// Whether two `WeakSdarc`s point to same pointee.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        // Each `SdarcInner` can have at most one `WeakSdarcInner` so we can do shallow comparison
+        Sdarc::ptr_eq(&self.sdarc_weak_inner, &other.sdarc_weak_inner)
+    }
+}
+
 impl<T: Send + Sync> WeakSdarc<T> {
     /// Unlike std `Arc` and `Weak`, `Sdarc` and `WeakSdarc` have resurrection mechanism.
     /// Even after strong count sum reaches zero, upgrade may still succeed, then it will be resurrected.

@@ -24,9 +24,8 @@ If constant `DOES_SHARD_INDEX_USE_CPU_INDEX` is false, then it uses fallback cas
 
 The API of `Sdarc` is similar to `Arc`. Some differences:
 
-- Sdarc doesn't support [`get_mut`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.get_mut), which gives mutable borrow when reference count is 1. Because `Sdarc` ref count operations are lock-free, and there is no way to know whether counter sum is 1 immediately.
+- `Sdarc` doesn't support operations that require ref count to be exactly 1, including [`get_mut`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.get_mut). Because `Sdarc` ref count operations are lock-free, and there are race conditions when loading counters and compute sum, so there is no cheap way to immediately know whether counter shards sum as 1.
 - Doesn't yet support unsized type.
-- TODO
 
 ### Atomic pointers
 
