@@ -1,17 +1,18 @@
 use crate::collector;
 use crate::collector::on_new_sdarc_allocated;
+use crate::shard_index::shard_indexes;
 use crate::sharded_alloc::{ShardedBox, ShardedDataPtr};
 use crate::tagged_counter::AtomicTaggedCounter;
+use crate::weak_sdarc::{ClearWeakBackRefResult, WeakSdarcInner, clear_weak_backref_impl};
 use std::any::type_name;
 use std::fmt::{Debug, Display, Formatter};
+use std::hash::Hash;
 use std::mem;
 use std::mem::offset_of;
 use std::ops::Deref;
-use std::hash::Hash;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::ptr::{NonNull, null_mut};
-use std::sync::OnceLock;
-use crate::weak_sdarc::{clear_weak_backref_impl, ClearWeakBackRefResult, WeakSdarcInner};
+use std::sync::{Arc, OnceLock};
 
 /// Sharded deferred atomic reference counting.
 ///
@@ -163,9 +164,7 @@ impl<T: Send + Sync> SdarcInner<T> {
         /// Initially current shard's counter is 1, other shards' counters are 0.
         /// Why use Relaxed ordering is ok: submitting it to collector uses locking,
         /// which ensures collector doesn't see counters before this increment.
-        counters
-            .at_curr_shard()
-            .increment_ref_count_relaxed();
+        counters.at_curr_shard().increment_ref_count_relaxed();
 
         SdarcInner {
             counters,
@@ -197,7 +196,7 @@ impl<T> Drop for Sdarc<T> {
         /// If it's dropped in collector thread, will notify collector to re-check it.
         /// It's put before decrementing counter to avoid use-after-free (found by miri).
         collector::on_sdarc_drop(self.inner_ref().counters.0);
-        
+
         /// Why use Release ordering:
         /// If the collector observes the decremented reference count (with tag set) using Acquire ordering,
         /// it should synchronize-with the decrement,
@@ -295,7 +294,7 @@ impl SdarcInnerFatPtr {
             vtable_ref: get_sdarc_vtable_ref::<T>(),
         }
     }
-    
+
     pub fn get_counters_ptr(self) -> ShardedDataPtr<AtomicTaggedCounter> {
         unsafe {
             self.ptr
@@ -320,3 +319,26 @@ impl SdarcInnerFatPtr {
 
 unsafe impl Send for SdarcInnerFatPtr {}
 unsafe impl Sync for SdarcInnerFatPtr {}
+
+impl<T: Send + Sync> Sdarc<T> {
+    /// Unlike [`Arc::strong_count`], because that `Sdarc`'s counters are sharded and can change concurrently,
+    /// the observed counter sum is inaccurate (and it may be negative in some rare cases).
+    pub fn estimate_strong_count(this: &Self) -> i64 {
+        let inner = this.inner_ref();
+        let mut sum: i64 = 0;
+        for shard_index in shard_indexes() {
+            sum += inner.counters[shard_index].load_relaxed().ref_count();
+        }
+        sum
+    }
+
+    /// Similar to [`Sdarc::estimate_strong_count`] but for weak count sum.
+    pub fn estimate_weak_count(this: &Self) -> i64 {
+        let inner = this.inner_ref();
+        if let Some(w) = inner.weak_inner_ref.get() {
+            Sdarc::estimate_strong_count(w)
+        } else {
+            0
+        }
+    }
+}
