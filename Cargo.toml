@@ -33,6 +33,9 @@ libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version =  "0.61", features = ["Win32_System_Threading"] }
+# without the "features = ["Win32_System_Threading"]", newly created repo can compile fine,
+# but if the repo has locked a different version of windows-sys then feature unification doesn't work then user will
+# have compile error "cannot find `Win32` in `windows_sys`". this is a footgun.
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(miri)"] }
