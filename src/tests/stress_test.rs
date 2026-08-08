@@ -613,3 +613,5 @@ fn stress_test() {
 // MIRIFLAGS="-Zmiri-ignore-leaks -Zmiri-env-forward=RUST_SDARC_SHARD_COUNT -Zmiri-env-forward=RUST_SDARC_COLLECTOR_INTERVAL_MS -Zmiri-env-forward=RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE" RUST_SDARC_SHARD_COUNT=4 RUST_SDARC_COLLECTOR_INTERVAL_MS=0 RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE=1 cargo +nightly miri test stress_test -- --nocapture
 // cannot run it with miri in windows due to parking_lot compatibility
 // the collector not exiting when app finishes is normal behavior. without miri-ignore-leaks it will treat it as leak.
+// Normal test:
+// RUST_TEST_NOCAPTURE=1 RUST_SDARC_COLLECTOR_INTERVAL_MS=0 RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE=1 cargo test

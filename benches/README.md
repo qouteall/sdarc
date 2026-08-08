@@ -43,7 +43,7 @@ curr_shard_index        time:   [4.1541 ns 4.1555 ns 4.1567 ns]
 
 Same as the above, but uses musl instead of glibc, aarch64-unknown-linux-musl
 
-(in musl aarch64, `sched_getcpu` uses syscall, so shard index is based on thread id hash. there will be more contention)
+(in musl aarch64, `sched_getcpu` uses syscall, so shard index is based on thread id hash. there will be more contention in counters. the `AtomicSdarc::borrow` uses thread-local hazard pointer slots so it's free of contention.)
 
 ```
 AtomicSdarc load_owned  time:   [9.8068 ms 9.8782 ms 9.9552 ms]
