@@ -7,7 +7,7 @@
 
 This library provides sharded-deferred-atomic-reference-counting (`Sdarc`). It can be used similar to `Arc`. A thread increment/decrement one counter shard. The `Sdarc` can be freely sent and shared between threads, so one counter shard may become negative. This reduces cache contention of incrementing/decrementing counter. 
 
-It doesn't check all counters after decrement. There is a background collector thread periodically checking the counters and do freeing (it uses tagged counter and two-stage collecting to solve race condition).
+It doesn't check all counters after decrement. There is a background collector thread periodically checking the counters and do freeing (it uses [tagged counter](https://docs.rs/sdarc/latest/sdarc/tagged_counter/index.html) and two-stage collecting to solve race condition).
 
 ### Shard selection
 
@@ -29,7 +29,7 @@ The API of `Sdarc` is similar to `Arc`. Some differences:
 
 ### Atomic pointers
 
-This library also provides atomic pointers `AtomicSdarc` and `AtomicNullableSdarc`. They have functionality similar to `ArcSwap`. It uses hazard pointer and [asymmetric fence](https://crates.io/crates/membarrier2) to solve race condition.
+This library also provides atomic pointers `AtomicSdarc` and `AtomicNullableSdarc`. They have functionality similar to `ArcSwap`. It uses hazard pointer and [asymmetric fence](https://crates.io/crates/membarrier2) to solve race condition ([implementation explanation](https://docs.rs/sdarc/latest/sdarc/atomic_sdarc/index.html)).
 
 Unlike std `Arc`, the `AtomicSdarc`(and `AtomicNullableSdarc`) allows borrowing content using hazard pointer, without incrementing reference count. This can allow a pointee with zero ref count sum to live for long time.
 
