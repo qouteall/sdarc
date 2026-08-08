@@ -3,6 +3,7 @@
 - Add `estimate_strong_count`, `estimate_weak_count`
 - Add `WeakSdarc::ptr_eq`
 - Add some trait impls
+- Fallback case `curr_shard_index` handle TLS destruction
 
 ## 0.1.1
 
