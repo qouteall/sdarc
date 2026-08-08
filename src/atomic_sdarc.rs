@@ -11,7 +11,8 @@
 //!
 //! Summarize asymmetric fence:
 //!
-//! - Light fence is just compiler fence that prevents instruction reordering.
+//! - Light fence is just compiler fence that prevents compiler from reordering instructions,
+//!   but doesn't interfere CPU's out-of-order execution.
 //! - Heavy fence uses OS API that sends interrupt to every core executing current process's thread.
 //! - The SeqCst operation implicitly includes a compiler fence. SeqCst operation "contains" light fence.
 //! - A light fence sync with heavy fence similar to SeqCst. However, the light fences don't sync with each other.
@@ -66,7 +67,7 @@
 //! Collector thread:
 //! 1. heavy barrier
 //! 2. for each thread's critical section flag, poll using Acquire until observing false
-//! 3. read counter sum in Acquire ordering. if 0, clear tags (there is a relaxed pre-read before, doesn't matter in ordering)
+//! 3. read counter sum as zero in Acquire ordering. clear tags (there is a relaxed pre-read before, doesn't matter in ordering)
 //! 4. in next collector inner iteration, heavy barrier again, poll until observing false again
 //! 5. read counter sum in Acquire ordering, if it stays 0 and no tag is observed, free the memory
 //! (assume that no weak ref is involved. if weak ref is involved there is one extra iteration)
@@ -105,58 +106,35 @@
 //!    Now RL is after CH, so the swapped pointer should also
 //!    be observable to reader. Reader won't read the stale pointer that is about to be freed.
 //!
-//! But consider that start from C++20, the SeqCst total order is no longer required
-//! to be consistent with happens-before.
-//! Is it possible that the inconsistency between SeqCst total order and happens-before causes
-//! previous reasoning to be flawed?
+//! Someone may argue that start from C++20, the SeqCst total order is no longer required
+//! to be consistent with happens-before relation. But that exception only happens
+//! when one atomic variable is sometimes operated using release-acquire and sometimes using seqcst.
+//! That doesn't happen in this library.
 //!
-//! First of all, SeqCst contains Release-Acquire. In the previous first case (RL is before CH2),
-//! the reasoning holds using only happens-before relation. So the first case is ok.
+//! The visibility chain in the second case (CH2 is before RL):
 //!
-//! The second case (CH2 is before RL) is more complex. The reader cannot read
-//! the stale pointer that's about to be freed.
-//! But it cannot be ensured by just Release-Acquire ordering.
-//! Reader uses Acquire to load pointer, and writer uses SeqCst to swap.
-//! There is Release-Acquire ordering that ensures reader doesn't read uninitialized data,
-//! but doesn't ensure reader don't read a stale pointer that's about to be freed.
-//! And the reader's light fence doesn't sync with writer's SeqCst swap.
-//! This is a complex case that involves interaction with SeqCst and Release-Acquire.
+//!  1. Writer swaps atomic pointer, SeqCst
+//!  2. Writer decrements ref count of old object, Release (sequenced-after 1)
+//!  3. Collector read ref count sum and get 0, Acquire (synchronizes-with 2)
+//!  4. Collector second iteration heavy fence CH2 (sequenced-after 3)
+//!  5. Reader light fence RL (sync between heavy fence and light fence, after 4)
+//!  6. Reader read atomic pointer, Acquire (sequenced-after 5)
 //!
-//! C++26 memory model has this definition of strongly happens-before:
+//! The SeqCst fence contains the power of AcqRel fence so the chain holds.
+//! Writer's atomic pointer swap is visible to reader.
 //!
-//! > Regardless of threads, evaluation A strongly happens-before evaluation B if any of the following is true:
-//! >
-//! > (1) A is sequenced-before B.
-//! >
-//! > (2) A synchronizes with B, and both A and B are sequentially consistent atomic operations.
-//! >
-//! > (3) A is sequenced-before X, X happens-before Y, and Y is sequenced-before B.
-//! >
-//! > (4) A strongly happens-before X, and X strongly happens-before B.
-//!
-//! In the second case (CH2 is before RL), the whole visibility chain is:
-//!   1. Writer swaps atomic pointer, SeqCst
-//!   2. Writer decrements ref count of old object, Release (sequenced-after 1)
-//!   3. Collector read ref count sum and get 0, Acquire (synchronizes-with 2)
-//!   4. Collector second iteration heavy fence CH2 (sequenced-after 3)
-//!   5. Reader light fence RL (sync between heavy fence and light fence, after 4)
-//!   6. Reader read atomic pointer, Acquire (sequenced-after 5)
-//!
-//! Then:
-//! - 1 sequenced-before 2, 2 happens-before 3, 3 sequenced-before 4, so 1 strongly happens-before 4, according to (3).
-//! - due to CH2 before RL, 4 strongly happens-before 5, according to (2)
-//! - 5 is sequenced-before 6, so 5 strongly happens-before 6, according to (1)
-//! - based the above three results, 1 strongly happens-before 6, according to (4)
-//!
-//! The strongly happens-before will be consistent with both Release-Acquire and SeqCst.
-//! So in that case reader cannot read a stale pointer that's about to be freed.
-//! The is ensured by reader syncing with collector and collector syncing with writer.
-//! Safe.
+//! Someone may argue that the setting of critical section flag to true uses Relaxed ordering
+//! which doesn't pair with reading of flag using Acquire.
+//! Because making flag becoming true visible is done by asymmetric fence, mentioned earlier.
+//! The setting flag to false uses Release which pairs with Acquire. It ensures that when
+//! collector has observed flag being true, then reader's incrementing counter
+//! happens-before collector's observing flag being false.
 //!
 //! ## Safety and memory ordering of hazard pointer
 //!
-//! The `load_owned` is already kind of fast. But it uses two atomic read-modify-write operations.
-//! For short-term reads it's not fast enough. So there is hazard pointer mechanism.
+//! The `load_owned` is already kind of fast. But in short-term read, it involves two atomic read-modify-write
+//! instructions (increment and decrement).
+//! For frequent short-term reads it's not fast enough. So there is hazard pointer mechanism.
 //!
 //! Hazard pointer mechanism allows a `Sdarc` pointee to be alive even if ref count sum becomes 0.
 //! Each thread has fixed amount of hazard pointer slots. When slots are full,
@@ -221,6 +199,46 @@
 //! that two different objects' types are the same. The hazard borrowing succeeds on the new object.
 //! In this case Miri consider the two equal pointers to have different provenance. The code
 //! uses re-loaded pointer to start borrowing which carries the new provenance.
+//!
+//! The borrowed atomic ptr can increment counter, thus become a living `Sdarc`.
+//! But in the [`crate::tagged_counter`] reasoning,
+//! collector observing increment in delay is fine because increment
+//! can only happen from another owner that collector can observe.
+//! However, that reason breaks in hazard pointer because hazard pointer correspond to
+//! no reference count but can allow cloning.
+//! Is there a race condition that a hazard-pointer borrowed `Sdarc` gets cloned,
+//! then borrowing finishes but the increment is not visible to collector?
+//! The collector reads hazard pointer in Acquire. If collector reads the null
+//! after borrowing finishes, collector can observe the incremented ref count.
+//! However, in this case, null is ambiguous. The null could also be the null that's before borrowing.
+//! Will it cause issue?
+//!
+//! Consider this case:
+//!
+//! Reader:
+//! 1. a previous borrow to another `Sdarc` pointee finished.
+//!    hazard pointer slot is set to null in Release (writing first null).
+//! 2. try to borrow another pointee. publish hazard pointer.
+//!    light fence (RL). re-load pointer. borrowing succeeded.
+//! 3. clone the `Sdarc`, increments ref count in Relaxed
+//! 4. stop borrowing. set hazard pointer slot to null in Release (writing second null).
+//!
+//! Collector:
+//! 1. heavy barrier (CH1)
+//! 2. load hazard pointers in Acquire
+//! 3. load counters in Acquire
+//! 4. heavy barrier (CH2)
+//! 5. load hazard pointers in Acquire
+//! 6. load counters in Acquire
+//!
+//! Consider the total order between RL, CH1 and CH2:
+//!
+//! - RL -> CH1 -> CH2. In that case, when collector loads null hazard pointer in Acquire, it must be the second null.
+//!                     The collector's loading of hazard pointer happens-after incrementing ref count. Safe.
+//! - CH1 -> RL -> CH2. Similar to the above, the collector second iteration's loading of hazard pointer in Acquire
+//!                     cannot load the first null. If it's null it must be the second null. Safe.
+//! - CH1 -> CH2 -> RL. The previous reasoning shows that reader re-load cannot read a stale pointer that's about to be freed.
+//!
 use crate::sdarc::{Sdarc, SdarcInner, SdarcInnerPtrErased};
 use append_only_vec::AppendOnlyVec;
 use crossbeam_utils::CachePadded;
@@ -291,7 +309,7 @@ impl<T> AtomicNullableSdarc<T> {
     /// If the pointer matches `if_matches`, it succeeds and sets pointer. In that case it returns Ok containing the original `Sdarc` (it points to the same as `if_matches`).
     /// If the pointer doesn't match `if_matches`, it returns Err.
     ///
-    /// The Sdarc delayed reclamation makes it free of ABA problem.
+    /// It's free of ABA problem because `if_matches` is live.
     #[allow(clippy::result_unit_err)]
     pub fn compare_and_set(
         &self,
@@ -403,7 +421,7 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     /// If the pointer matches `if_matches`, it succeeds and sets pointer. In that case it returns Ok containing the original `Sdarc` (it points to the same as `if_matches`).
     /// If the pointer doesn't match `if_matches`, it returns Err.
     ///
-    /// The Sdarc delayed reclamation makes it free of ABA problem.
+    /// It's free of ABA problem because `if_matches` is live.
     #[allow(clippy::result_unit_err)]
     pub fn compare_and_set(
         &self,

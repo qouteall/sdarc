@@ -210,7 +210,12 @@ cfg_if::cfg_if! {
         /// Note that it's a theoretical estimation. In real-world workloads it won't just do
         /// counter increment/decrement.
         pub fn curr_shard_index() -> ShardIndex {
-            SHARD_INDEX_FROM_THREAD_ID_HASH.with(|v| *v)
+            // Dropping a `Sdarc` stored in thread local could cause `curr_shard_index`
+            // to be called when another TLS has dropped.
+            // Use 0 shard index as fallback.
+            SHARD_INDEX_FROM_THREAD_ID_HASH
+                .try_with(|v| *v)
+                .unwrap_or_else(|_| ShardIndex::from_usize(0))
         }
 
         pub const DOES_SHARD_INDEX_USE_CPU_INDEX: bool = false;

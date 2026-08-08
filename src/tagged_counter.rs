@@ -37,19 +37,29 @@
 //!
 //! The increment of counter uses Relaxed ordering. The reason is similar to std Arc.
 //! Increment can only happen when an instance
-//! of Sdarc is live, which means counter sum is at least 1.
+//! of Sdarc is live (hazard pointer is an exception, explained in [`crate::atomic_sdarc`]),
+//! which means counter sum is at least 1.
 //! Collector delaying observing the increment is fine,
-//! as long as decrement is not visible before increment.
+//! because increment requires a reference holder.
+//! Even if collector don't observe the increment,
+//! as long as collector observes the original reference hold, it's still safe.
 //!
 //! In some platforms, the shard index is determined by current CPU index, which is non-deterministic.
 //! So a thread could first increment one shard then decrement another shard.
-//! The Release-Acquire ordering ensures that when collector observes the decrement,
-//! all changes made by the thread that does the Release decrement is visible to collector,
-//! even it's another shard. Collector uses Acquire read to all counter shards.
-//!
-//! For cross-thread case
-//! (increment in one thread, send to another thread to decrement),
-//! other synchronizations have established that incrementing counter happens-before decrementing counter.
+//! The increment happens-before decrement.
+//! The Release-Acquire ordering ensures that if collector observes the decrement,
+//! the increment that happens-before decrement is visible to collector.
+//! However, the previous race condition still exists.
+//! It's possible that:
+//! - One thread increments first counter shard then decrement second counter shard
+//! - Collector reads first counter shard in Acquire. But increment is Relaxed so collector
+//!   may not observe the increment.
+//! - Collector reads second counter shard in Acquire. The decrement is observed.
+//!   The increment is visible to collector, but collector doesn't re-check the first counter shard
+//!   until next iteration.
+//! - If no ref count mutation occurs, collector can observe the increment in next iteration, which is safe.
+//! - If there is ref count mutation, then to make collector free it the incremented counter must be decremented.
+//!   But decrementing will leave tag. When collector observed decremented count, collector also observes tag.
 //!
 //! About overflow/underflow: the max reference count (higher 63 bit) is 2^62-1, min is -2^62. In ideal case, a fast uncontended atomic takes 3 cycles for 1 increment, given 4GHz frequency, overflowing/underflowing it takes about 110 years. If there is contention, incr/decr will be slower. So no need to care about overflow/underflow.
 //!
@@ -134,7 +144,6 @@ impl AtomicTaggedCounter {
     }
 
     pub fn fetch_and_clear_tag_acquire(&self) -> TaggedCounter {
-        // no need to use Release. decrementer use Release which won't sync with Release
         let v = self
             .0
             .fetch_and(Self::MASK_FOR_CLEARING_TAG, Ordering::Acquire);

@@ -13,7 +13,7 @@ use std::mem::offset_of;
 use std::ops::Deref;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::ptr::{NonNull, null_mut};
-use std::sync::{Arc, OnceLock};
+use std::sync::{OnceLock};
 
 /// Sharded deferred atomic reference counting.
 ///
