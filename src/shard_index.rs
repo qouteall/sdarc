@@ -142,8 +142,10 @@ impl<T> IndexMut<ShardIndex> for ShardsArr<T> {
 
 // Platform-specific `curr_shard_index` -----
 
+// Note: miri doesn't support `GetCurrentProcessorNumber` and `sched_getcpu`,
+// so under miri a dedicated implementation returning a random shard index is used.
 cfg_if::cfg_if! {
-    if #[cfg(target_os = "windows")] {
+    if #[cfg(all(target_os = "windows", not(miri)))] {
         /// In Windows, the current shard index is obtained by `GetCurrentProcessorNumber`
         ///
         /// The Microsoft documentation doesn't mention whether `GetCurrentProcessorNumber` uses syscall. But according to [this blog](https://www.alex-ionescu.com/solution-to-challenge/) the reverse-engineered machine code contains no syscall in X86 (except WOW64, which only happens to 32-bit applications).
@@ -156,6 +158,7 @@ cfg_if::cfg_if! {
         pub const DOES_SHARD_INDEX_USE_CPU_INDEX: bool = true;
     } else if #[cfg(all(
         target_os = "linux",
+        not(miri),
         // musl does a real syscall in `sched_getcpu` on aarch64, which is slow,
         // so that case falls back to thread id hash below.
         not(all(target_env = "musl", target_arch = "aarch64"))
@@ -176,6 +179,17 @@ cfg_if::cfg_if! {
         }
 
         pub const DOES_SHARD_INDEX_USE_CPU_INDEX: bool = true;
+    } else if #[cfg(miri)] {
+        /// In miri, use random shard index in each call.
+        /// Simulate frequent cross-CPU thread migration.
+        /// Increase the chance of catching potential bugs.
+        pub fn curr_shard_index() -> ShardIndex {
+            use rand::RngExt;
+            let value: u64 = rand::rng().random();
+            ShardIndex::from_u64(value)
+        }
+
+        pub const DOES_SHARD_INDEX_USE_CPU_INDEX: bool = false;
     } else {
         thread_local! {
             static SHARD_INDEX_FROM_THREAD_ID_HASH: ShardIndex = shard_index_from_thread_id_hash();

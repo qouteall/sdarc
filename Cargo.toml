@@ -28,6 +28,10 @@ rustc-hash = "2.1"
 membarrier2 = "0.1"
 oneshot = { version = "0.2", features = ["std"] }
 
+# in miri the shard_index returns random shard inddex each time
+[target.'cfg(miri)'.dependencies]
+rand = "0.10"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 

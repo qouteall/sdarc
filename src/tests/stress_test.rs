@@ -5,6 +5,13 @@
 //! downgrade/upgrade, cross-thread message passing, and short-lived child
 //! threads — but with `std::thread` only.
 //!
+//! Instead of a single `AtomicSdarc`, the "cache database" is an array of
+//! slots that mixes `AtomicSdarc` and `AtomicNullableSdarc`. Slots are
+//! frequently replaced with newly allocated maps (nullable slots occasionally
+//! become null). Borrower threads randomly accumulate many borrow guards from
+//! random slots, randomly access data through the held guards, and drop the
+//! guards in random order.
+//!
 //! Iteration counts and thread counts are selected with `cfg(miri)`: full
 //! values for native runs, much smaller values under Miri so it finishes in
 //! reasonable time.
@@ -16,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Barrier, mpsc};
 use std::thread;
-use crate::atomic_sdarc::AtomicSdarc;
+use crate::atomic_sdarc::{AtomicNullableSdarc, AtomicSdarc, AtomicSdarcBorrowGuard};
 use crate::collector::collector_update_now_and_wait;
 
 // ---------------------------------------------------------------------------
@@ -108,6 +115,57 @@ impl CacheEntry {
 }
 
 // ===========================================================================
+// CacheSlot — one atomic slot in the "cache database".
+// Mixes `AtomicSdarc` and `AtomicNullableSdarc`.
+// ===========================================================================
+
+type CacheMap = HashMap<u64, CacheEntry>;
+
+enum CacheSlot {
+    NonNull(AtomicSdarc<CacheMap>),
+    Nullable(AtomicNullableSdarc<CacheMap>),
+}
+
+impl CacheSlot {
+    /// Borrow the current map via hazard pointer.
+    /// Returns `None` for a nullable slot that is currently null.
+    fn borrow(&self) -> Option<AtomicSdarcBorrowGuard<'_, CacheMap>> {
+        match self {
+            CacheSlot::NonNull(a) => Some(a.borrow()),
+            CacheSlot::Nullable(a) => a.borrow(),
+        }
+    }
+
+    /// Load the current map as an owned `Sdarc`.
+    /// Returns `None` for a nullable slot that is currently null.
+    fn load_owned(&self) -> Option<Sdarc<CacheMap>> {
+        match self {
+            CacheSlot::NonNull(a) => Some(a.load_owned()),
+            CacheSlot::Nullable(a) => a.load_owned(),
+        }
+    }
+
+    /// Replace the current pointee with a newly allocated map.
+    fn store_new(&self, map: CacheMap) {
+        match self {
+            CacheSlot::NonNull(a) => a.store(Sdarc::new(map)),
+            CacheSlot::Nullable(a) => a.store(Some(Sdarc::new(map))),
+        }
+    }
+
+    fn is_nullable(&self) -> bool {
+        matches!(self, CacheSlot::Nullable(_))
+    }
+
+    /// Set a nullable slot to null. No-op for non-null slots.
+    fn store_none(&self) {
+        if let CacheSlot::Nullable(a) = self {
+            a.store(None);
+        }
+    }
+}
+
+// ===========================================================================
 // SharedContext — held in Sdarc, shared by all workers
 // ===========================================================================
 
@@ -115,8 +173,10 @@ use crate::sdarc::{ Sdarc};
 use crate::weak_sdarc::WeakSdarc;
 
 struct SharedContext {
-    /// The "cache database" — periodically swapped by the updater thread.
-    atomic_cache: AtomicSdarc<HashMap<u64, CacheEntry>>,
+    /// The "cache database" — an array of atomic slots mixing
+    /// `AtomicSdarc` and `AtomicNullableSdarc`, frequently replaced
+    /// with newly allocated maps by the updater and the workers.
+    cache_slots: Vec<CacheSlot>,
 
     /// Pool of hot items for clone/drop contention.
     hot_pool: Vec<Sdarc<TrackedDrop>>,
@@ -137,11 +197,11 @@ struct SharedContext {
 
 impl SharedContext {
     fn new(
-        atomic_cache: AtomicSdarc<HashMap<u64, CacheEntry>>,
+        cache_slots: Vec<CacheSlot>,
         hot_pool: Vec<Sdarc<TrackedDrop>>,
     ) -> Self {
         Self {
-            atomic_cache,
+            cache_slots,
             hot_pool,
             ops: AtomicU64::new(0),
             upgrades_ok: AtomicU64::new(0),
@@ -196,11 +256,17 @@ const PRODUCERS: usize = 10;
 #[cfg(miri)]
 const PRODUCERS: usize = 2;
 
-/// Number of borrower threads hammering `AtomicSdarc::borrow`.
+/// Number of borrower threads hammering the atomic slots' `borrow`.
 #[cfg(not(miri))]
 const BORROWERS: usize = 4;
 #[cfg(miri)]
 const BORROWERS: usize = 2;
+
+/// Number of atomic cache slots (alternating `AtomicSdarc` / `AtomicNullableSdarc`).
+#[cfg(not(miri))]
+const CACHE_SLOTS: usize = 8;
+#[cfg(miri)]
+const CACHE_SLOTS: usize = 4;
 
 /// Size of the hot pool.
 #[cfg(not(miri))]
@@ -219,6 +285,11 @@ const MAX_HAND_SIZE: usize = 16;
 
 /// Maximum held hot items per worker before truncation.
 const MAX_HOT_HAND_SIZE: usize = 12;
+
+/// Maximum borrow guards held simultaneously per borrower thread.
+/// Must stay below the per-thread hazard pointer slot count (15);
+/// beyond that, borrow falls back to `load_owned`.
+const MAX_HELD_GUARDS: usize = 8;
 
 // ===========================================================================
 // Scenario
@@ -241,10 +312,19 @@ fn scenario_stress() {
             .map(|i| Sdarc::new(TrackedDrop::new(i as u64)))
             .collect();
 
-        let initial_cache = AtomicSdarc::new(HashMap::new());
+        // ---- Build the cache slots, alternating non-null / nullable ----
+        let cache_slots: Vec<CacheSlot> = (0..CACHE_SLOTS)
+            .map(|i| {
+                if i % 2 == 0 {
+                    CacheSlot::NonNull(AtomicSdarc::new(HashMap::new()))
+                } else {
+                    CacheSlot::Nullable(AtomicNullableSdarc::new())
+                }
+            })
+            .collect();
 
         // ---- Build shared context ----
-        let context = Sdarc::new(SharedContext::new(initial_cache, hot_pool));
+        let context = Sdarc::new(SharedContext::new(cache_slots, hot_pool));
 
         // ---- Per-worker mpsc channels ----
         let mut worker_receivers: Vec<mpsc::Receiver<Sdarc<CacheEntry>>> = vec![];
@@ -257,24 +337,31 @@ fn scenario_stress() {
             .collect();
 
         // =====================================================================
-        // 1. Background cache updater
+        // 1. Background cache updater — keeps replacing random slots with
+        //    newly allocated maps. Nullable slots occasionally become null.
         // =====================================================================
         let updater_ctx = context.clone();
         let updater_handle = thread::spawn(move || {
             let mut rng = CheapRng::new(0xc0ffee);
             let mut generation: u64 = 0;
+            let slot_count = updater_ctx.cache_slots.len();
             for _ in 0..UPDATER_ITERATIONS {
                 if updater_ctx.stop.load(Ordering::Relaxed) {
                     break;
                 }
                 generation += 1;
-                let entry_count = 3 + rng.usize(12);
-                let mut map = HashMap::with_capacity(entry_count);
-                for _ in 0..entry_count {
-                    let k = rng.next();
-                    map.insert(k, CacheEntry::new(k, rng.next(), generation));
+                let slot = &updater_ctx.cache_slots[rng.usize(slot_count)];
+                if slot.is_nullable() && rng.bool(15) {
+                    slot.store_none();
+                } else {
+                    let entry_count = 3 + rng.usize(12);
+                    let mut map = HashMap::with_capacity(entry_count);
+                    for _ in 0..entry_count {
+                        let k = rng.next();
+                        map.insert(k, CacheEntry::new(k, rng.next(), generation));
+                    }
+                    slot.store_new(map);
                 }
-                let _old = updater_ctx.atomic_cache.swap(Sdarc::new(map));
                 updater_ctx.swaps.fetch_add(1, Ordering::Relaxed);
                 thread::yield_now();
             }
@@ -291,31 +378,35 @@ fn scenario_stress() {
                 let ctx = producer_ctx.clone();
                 thread::spawn(move || {
                     let mut rng = CheapRng::new((p + 100) as u64 * 0x9e3779b9);
+                    let slot_count = ctx.cache_slots.len();
                     for _ in 0..PRODUCER_ITERATIONS {
                         if ctx.stop.load(Ordering::Relaxed) {
                             break;
                         }
-                        let cache = ctx.atomic_cache.load_owned();
-                        if !cache.is_empty() {
-                            let keys: Vec<u64> = cache.keys().copied().collect();
-                            let k = keys[rng.usize(keys.len())];
-                            if let Some(entry) = cache.get(&k) {
-                                let clone = Sdarc::new(entry.clone());
-                                let dst = rng.usize(STD_WORKERS);
-                                let _ = senders[dst].send(clone);
-                                ctx.ops.fetch_add(1, Ordering::Relaxed);
+                        let slot = &ctx.cache_slots[rng.usize(slot_count)];
+                        if let Some(cache) = slot.load_owned() {
+                            if !cache.is_empty() {
+                                let keys: Vec<u64> = cache.keys().copied().collect();
+                                let k = keys[rng.usize(keys.len())];
+                                if let Some(entry) = cache.get(&k) {
+                                    let clone = Sdarc::new(entry.clone());
+                                    let dst = rng.usize(STD_WORKERS);
+                                    let _ = senders[dst].send(clone);
+                                    ctx.ops.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
-                        drop(cache);
                     }
                 })
             })
             .collect();
 
         // =====================================================================
-        // 3. Borrower threads — hammer `AtomicSdarc::borrow` while the
-        //    updater swaps the cache. Exercises the hazard-pointer path and
-        //    the owned-load fallback under contention.
+        // 3. Borrower threads — randomly accumulate borrow guards from random
+        //    slots, randomly access data through the held guards, and drop
+        //    guards in random order, all while the updater swaps slots.
+        //    Exercises the hazard-pointer path and the owned-load fallback
+        //    under contention.
         // =====================================================================
         let borrower_ctx = context.clone();
         let borrowers: Vec<thread::JoinHandle<()>> = (0..BORROWERS)
@@ -323,28 +414,54 @@ fn scenario_stress() {
                 let ctx = borrower_ctx.clone();
                 thread::spawn(move || {
                     let mut rng = CheapRng::new((b + 500) as u64 * 0x85ebca6b);
+                    let slot_count = ctx.cache_slots.len();
+                    let mut guards: Vec<AtomicSdarcBorrowGuard<'_, CacheMap>> = vec![];
                     for _ in 0..BORROWER_ITERATIONS {
                         if ctx.stop.load(Ordering::Relaxed) {
                             break;
                         }
-                        {
-                            let guard = ctx.atomic_cache.borrow();
-                            if !guard.is_empty() {
-                                // The borrowed map is immutable while borrowed,
-                                // and no generation-0 entry may ever be visible.
-                                for entry in guard.values() {
-                                    if entry.generation == 0 {
-                                        ctx.invariant_ok.store(false, Ordering::Relaxed);
+                        match rng.usize(10) {
+                            // Borrow another guard from a random slot.
+                            0..=4 => {
+                                if guards.len() < MAX_HELD_GUARDS {
+                                    let slot = &ctx.cache_slots[rng.usize(slot_count)];
+                                    if let Some(g) = slot.borrow() {
+                                        guards.push(g);
                                     }
+                                    ctx.borrows.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                            // guard dropped here, hazard pointer unpublished
+                            // Access data through a random held guard.
+                            5..=7 => {
+                                if !guards.is_empty() {
+                                    let g = &guards[rng.usize(guards.len())];
+                                    // The borrowed map is immutable while borrowed,
+                                    // and no generation-0 entry may ever be visible.
+                                    for entry in g.values() {
+                                        if entry.generation == 0 {
+                                            ctx.invariant_ok.store(false, Ordering::Relaxed);
+                                        }
+                                    }
+                                    let _ = std::hint::black_box(g.len());
+                                }
+                            }
+                            // Drop one random guard (random drop order).
+                            8 => {
+                                if !guards.is_empty() {
+                                    let idx = rng.usize(guards.len());
+                                    guards.swap_remove(idx);
+                                }
+                            }
+                            // Drop all guards at once.
+                            _ => {
+                                guards.clear();
+                            }
                         }
-                        ctx.borrows.fetch_add(1, Ordering::Relaxed);
                         if rng.bool(30) {
                             thread::yield_now();
                         }
                     }
+                    // Remaining guards dropped here, hazard pointers unpublished
                 })
             })
             .collect();
@@ -369,6 +486,8 @@ fn scenario_stress() {
                     let mut hot_hand: Vec<Sdarc<TrackedDrop>> = vec![];
                     let mut weak_set: Vec<WeakSdarc<CacheEntry>> = vec![];
                     let mut spawned: Vec<thread::JoinHandle<()>> = vec![];
+                    let mut worker_generation: u64 = 0;
+                    let slot_count = ctx.cache_slots.len();
 
                     barrier.wait();
                     for _iter in 0..WORKER_ITERATIONS {
@@ -382,18 +501,19 @@ fn scenario_stress() {
                             ctx.ops.fetch_add(1, Ordering::Relaxed);
                         }
 
-                        match rng.usize(10) {
+                        match rng.usize(11) {
                             0 => {
-                                // Load cache, clone entry.
-                                let cache = ctx.atomic_cache.load_owned();
-                                if !cache.is_empty() {
-                                    let keys: Vec<u64> = cache.keys().copied().collect();
-                                    let k = keys[rng.usize(keys.len())];
-                                    if let Some(entry) = cache.get(&k) {
-                                        hand.push(Sdarc::new(entry.clone()));
+                                // Load a random slot, clone entry.
+                                let slot = &ctx.cache_slots[rng.usize(slot_count)];
+                                if let Some(cache) = slot.load_owned() {
+                                    if !cache.is_empty() {
+                                        let keys: Vec<u64> = cache.keys().copied().collect();
+                                        let k = keys[rng.usize(keys.len())];
+                                        if let Some(entry) = cache.get(&k) {
+                                            hand.push(Sdarc::new(entry.clone()));
+                                        }
                                     }
                                 }
-                                drop(cache);
                                 ctx.ops.fetch_add(1, Ordering::Relaxed);
                             }
                             1 => {
@@ -472,30 +592,57 @@ fn scenario_stress() {
                                 }
                             }
                             8 => {
-                                // Borrow the cache via hazard pointer, clone an entry.
-                                let guard = ctx.atomic_cache.borrow();
-                                if !guard.is_empty() {
-                                    let keys: Vec<u64> = guard.keys().copied().collect();
-                                    let k = keys[rng.usize(keys.len())];
-                                    if let Some(entry) = guard.get(&k) {
-                                        if entry.generation == 0 {
-                                            ctx.invariant_ok.store(false, Ordering::Relaxed);
+                                // Borrow a random slot via hazard pointer, clone an entry.
+                                let slot = &ctx.cache_slots[rng.usize(slot_count)];
+                                if let Some(guard) = slot.borrow() {
+                                    if !guard.is_empty() {
+                                        let keys: Vec<u64> = guard.keys().copied().collect();
+                                        let k = keys[rng.usize(keys.len())];
+                                        if let Some(entry) = guard.get(&k) {
+                                            if entry.generation == 0 {
+                                                ctx.invariant_ok.store(false, Ordering::Relaxed);
+                                            }
+                                            hand.push(Sdarc::new(entry.clone()));
                                         }
-                                        hand.push(Sdarc::new(entry.clone()));
                                     }
                                 }
-                                drop(guard);
                                 ctx.borrows.fetch_add(1, Ordering::Relaxed);
                             }
                             9 => {
-                                // Hold several borrows alive at once to exercise
-                                // multiple hazard pointer slots per thread.
-                                let g1 = ctx.atomic_cache.borrow();
-                                let g2 = ctx.atomic_cache.borrow();
-                                let g3 = ctx.atomic_cache.borrow();
-                                let len_sum = g1.len() + g2.len() + g3.len();
+                                // Hold several borrows from random slots alive at
+                                // once to exercise multiple hazard pointer slots
+                                // per thread.
+                                let mut held = vec![];
+                                for _ in 0..3 {
+                                    let slot = &ctx.cache_slots[rng.usize(slot_count)];
+                                    if let Some(g) = slot.borrow() {
+                                        held.push(g);
+                                    }
+                                }
+                                let mut len_sum = 0usize;
+                                for g in &held {
+                                    len_sum += g.len();
+                                }
                                 let _ = std::hint::black_box(len_sum);
-                                ctx.borrows.fetch_add(3, Ordering::Relaxed);
+                                ctx.borrows.fetch_add(held.len() as u64, Ordering::Relaxed);
+                            }
+                            10 => {
+                                // Churn: replace a random slot with a freshly
+                                // allocated map, adding writer contention on
+                                // top of the background updater.
+                                worker_generation += 1;
+                                let slot = &ctx.cache_slots[rng.usize(slot_count)];
+                                let entry_count = 1 + rng.usize(6);
+                                let mut map = HashMap::with_capacity(entry_count);
+                                for _ in 0..entry_count {
+                                    let k = rng.next();
+                                    map.insert(
+                                        k,
+                                        CacheEntry::new(k, rng.next(), worker_generation),
+                                    );
+                                }
+                                slot.store_new(map);
+                                ctx.swaps.fetch_add(1, Ordering::Relaxed);
                             }
                             _ => unreachable!(),
                         }
@@ -609,9 +756,14 @@ fn stress_test() {
     scenario_stress();
 }
 
-// How to run:
+// To increase chance of exposing possible memory safety issue,
+// make collector run faster using
+// RUST_SDARC_COLLECTOR_INTERVAL_MS=0 RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE=1
+//
+// How to run in miri:
 // MIRIFLAGS="-Zmiri-ignore-leaks -Zmiri-env-forward=RUST_SDARC_SHARD_COUNT -Zmiri-env-forward=RUST_SDARC_COLLECTOR_INTERVAL_MS -Zmiri-env-forward=RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE" RUST_SDARC_SHARD_COUNT=4 RUST_SDARC_COLLECTOR_INTERVAL_MS=0 RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE=1 cargo +nightly miri test stress_test -- --nocapture
 // cannot run it with miri in windows due to parking_lot compatibility
 // the collector not exiting when app finishes is normal behavior. without miri-ignore-leaks it will treat it as leak.
-// Normal test:
-// RUST_TEST_NOCAPTURE=1 RUST_SDARC_COLLECTOR_INTERVAL_MS=0 RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE=1 cargo test
+//
+// Run normally:
+// RUST_TEST_NOCAPTURE=1 RUST_SDARC_COLLECTOR_INTERVAL_MS=0 RUST_SDARC_TEST_DISABLE_SHARDED_ALLOC_MAINTENANCE=1 cargo test --release
