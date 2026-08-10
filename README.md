@@ -63,6 +63,10 @@ This library doesn't suit these use cases:
 
 ### Appendix
 
+#### About "deferred"
+
+The "deferred" here means collection is deferred. In sdarc, the counter increment/decrement is still immediate. This is different to other deferred reference counting schemes where counter decrement can be deferred.
+
 #### Comparison with Linux percpu-refcount:
 
 - Linux percpu-refcount has a special owner and has two stages. In the first stage, increment/decrement use the per-CPU ref count slot. When the original owner drops reference, it switches to one atomic counter (the switching is synced by RCU). In `Sdarc` there is no special owner (similar to `Arc`).
