@@ -1,3 +1,4 @@
+#![allow(clippy::doc_overindented_list_items)]
 //! Atomic Sdarc pointers.
 //!
 //! For usage, see [`AtomicSdarc`] and [`AtomicNullableSdarc`].
@@ -70,7 +71,7 @@
 //! 3. read counter sum as zero in Acquire ordering. clear tags (there is a relaxed pre-read before, doesn't matter in ordering)
 //! 4. in next collector inner iteration, heavy barrier again, poll until observing false again
 //! 5. read counter sum in Acquire ordering, if it stays 0 and no tag is observed, free the memory
-//! (assume that no weak ref is involved. if weak ref is involved there is one extra iteration)
+//!    (assume that no weak ref is involved. if weak ref is involved there is one extra iteration)
 //!
 //! Normally if reader is unscheduled between 3 and 4, collector will be polling, until reader exits critical section.
 //!
@@ -109,7 +110,7 @@
 //! Someone may argue that start from C++20, the SeqCst total order is no longer required
 //! to be consistent with happens-before relation. But that exception only happens
 //! when one atomic variable is sometimes operated using release-acquire and sometimes using seqcst.
-//! That doesn't happen in this library.
+//! This library doesn't mix release-acquire and seqcst for reference count operations.
 //!
 //! The visibility chain in the second case (CH2 is before RL):
 //!
@@ -142,7 +143,7 @@
 //! Also when the re-loaded pointer is different to pre-loaded pointer it also falls back to `load_owned`.
 //! The hazard pointer borrower doesn't do retry. This gives an upper bound of instruction count required to
 //! start borrowing hazard pointer
-//! (instruction count is bounded, but time doesn't necessarily bound as OS scheduling is non-deterministic).
+//! (except for each thread's first use. `obtain_per_thread_shared_hazard_data` is roughly O(thread_count) ) .
 //!
 //! Reader:
 //! 1. load atomic ptr, Relaxed
@@ -241,7 +242,6 @@
 //!
 use crate::sdarc::{Sdarc, SdarcInner, SdarcInnerPtrErased};
 use append_only_vec::AppendOnlyVec;
-use crossbeam_utils::CachePadded;
 use rustc_hash::FxHashSet;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -286,8 +286,6 @@ impl<T> AtomicNullableSdarc<T> {
     ///
     /// If you just want to do short-term read, it's recommended to use [`AtomicNullableSdarc::borrow`] which
     /// can be faster (it uses hazard pointer, requiring no atomic read-modify-write operation in happy path).
-    ///
-    /// About implementation: [`PerThreadReaderCriticalSectionFlag`]
     pub fn load_owned(&self) -> Option<Sdarc<T>> {
         load_atomic_ptr_owned(&self.inner_ptr)
     }
@@ -363,8 +361,6 @@ impl<T> AtomicNullableSdarc<T> {
     /// The guard can keep the Sdarc pointee alive even when its reference count sum reach zero.
     ///
     /// It returns None if the loaded pointer is null.
-    ///
-    /// About implementation: [`try_borrow_from_atomic_ptr_using_hazard_pointer`]
     #[allow(clippy::needless_lifetimes)]
     pub fn borrow<'a>(&'a self) -> Option<AtomicSdarcBorrowGuard<'a, T>> {
         borrow_from_atomic_ptr(&self.inner_ptr)
@@ -403,8 +399,6 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     ///
     /// If you just want to do short-term read, it's recommended to use [`AtomicSdarc::borrow`] which
     /// can be faster (it uses hazard pointer, requiring no atomic read-modify-write operation in happy path).
-    ///
-    /// About implementation: [`PerThreadReaderCriticalSectionFlag`]
     pub fn load_owned(&self) -> Sdarc<T> {
         self.0.load_owned().unwrap()
     }
@@ -443,8 +437,6 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     /// After the atomic pointer changes, the existing guard still borrows the previous pointee.
     ///
     /// The guard can keep the Sdarc pointee alive even when its reference count sum reach zero.
-    ///
-    /// About implementation: [`try_borrow_from_atomic_ptr_using_hazard_pointer`]
     #[allow(clippy::needless_lifetimes)]
     pub fn borrow<'a>(&'a self) -> AtomicSdarcBorrowGuard<'a, T> {
         self.0.borrow().unwrap()
@@ -462,10 +454,10 @@ impl<T: Send + Sync> AtomicSdarc<T> {
     }
 }
 
-/// Why 15: the [`PerThreadSharedHazardData`] contains hazard pointer slots and two `AtomicBool`s.
+/// Why 15: the [`PerThreadAtomicReaderPublishedSignals`] contains hazard pointer slots and two `AtomicBool`s.
 /// And it's held in `CachePadded` which is 128 align in mainstream platform.
 /// If we use 8, then it wastes space. Using 15 will make padding space less than a pointer width.
-/// The added scanning is cheap because they are in same cache line.
+/// The added scanning is cheap because [`PerThreadAtomicReaderPublishedSignals`] has 128 alignment.
 const HZ_PTR_SLOT_COUNT: usize = 15;
 
 #[derive(Copy, Clone, Debug)]
@@ -515,14 +507,15 @@ impl PerThreadReaderCriticalSectionFlag {
 /// It will only be written by local thread.
 /// The collector thread only reads it.
 /// This makes it much simpler than arc-swap's hazard pointer implementation. Also, there is no "debt paying".
-pub(crate) struct PerThreadSharedHazardData {
+#[repr(align(128))]
+pub(crate) struct PerThreadAtomicReaderPublishedSignals {
     pub hazard_ptr_slots: [AtomicPtr<u8>; HZ_PTR_SLOT_COUNT],
     pub is_used: AtomicBool,
 
     pub reader_critical_section_flag: PerThreadReaderCriticalSectionFlag,
 }
 
-impl PerThreadSharedHazardData {
+impl PerThreadAtomicReaderPublishedSignals {
     fn load_relaxed(&self, index: HzSlotIndex) -> *mut u8 {
         self.hazard_ptr_slots[index.0 as usize].load(Ordering::Relaxed)
     }
@@ -549,30 +542,30 @@ impl HzSlotIndex {
 // The AppendOnlyVec is simpler than manually making a lock-free linked list.
 // It's append-only, no freeing, avoid race condition of freeing it.
 // Its size is as large as the max amount of threads that use atomic sdarc at the same time.
-static SHARED_HAZARD_DATA: AppendOnlyVec<CachePadded<PerThreadSharedHazardData>> =
+static SHARED_HAZARD_DATA: AppendOnlyVec<PerThreadAtomicReaderPublishedSignals> =
     AppendOnlyVec::new();
 
-fn obtain_per_thread_shared_hazard_data() -> &'static PerThreadSharedHazardData {
+fn obtain_per_thread_shared_hazard_data() -> &'static PerThreadAtomicReaderPublishedSignals {
     for e in SHARED_HAZARD_DATA.iter() {
         let old_is_used = e.is_used.swap(true, Ordering::Acquire);
         if !old_is_used {
             // claimed by current thread
-            return e.deref();
+            return e;
         }
     }
 
-    let r = PerThreadSharedHazardData {
+    let r = PerThreadAtomicReaderPublishedSignals {
         hazard_ptr_slots: array::from_fn(|_| AtomicPtr::new(null_mut())),
         is_used: AtomicBool::new(true),
         reader_critical_section_flag: PerThreadReaderCriticalSectionFlag::new(),
     };
-    let idx = SHARED_HAZARD_DATA.push(CachePadded::new(r));
+    let idx = SHARED_HAZARD_DATA.push(r);
     let result = &SHARED_HAZARD_DATA[idx];
     assert!(result.is_used.load(Ordering::Relaxed));
     result
 }
 
-fn release_hazard_data(r: &'static PerThreadSharedHazardData) {
+fn release_hazard_data(r: &'static PerThreadAtomicReaderPublishedSignals) {
     assert!(
         r.hazard_ptr_slots
             .iter()
@@ -586,7 +579,7 @@ fn release_hazard_data(r: &'static PerThreadSharedHazardData) {
     assert!(old_used);
 }
 
-struct PerThreadSharedHazardDataRef(&'static PerThreadSharedHazardData);
+struct PerThreadSharedHazardDataRef(&'static PerThreadAtomicReaderPublishedSignals);
 
 impl Drop for PerThreadSharedHazardDataRef {
     fn drop(&mut self) {
@@ -599,13 +592,13 @@ thread_local! {
         PerThreadSharedHazardDataRef(obtain_per_thread_shared_hazard_data());
 }
 
-fn curr_thread_shared_hazard_data() -> &'static PerThreadSharedHazardData {
+fn curr_thread_shared_hazard_data() -> &'static PerThreadAtomicReaderPublishedSignals {
     CURR_THREAD_SHARD_HAZARD_DATA_REF.with(|r| r.0)
 }
 
-pub(crate) fn traverse_all_hazard_datum(mut func: impl FnMut(&'static PerThreadSharedHazardData)) {
+pub(crate) fn traverse_all_hazard_datum(mut func: impl FnMut(&'static PerThreadAtomicReaderPublishedSignals)) {
     for e in SHARED_HAZARD_DATA.iter() {
-        func(e.deref());
+        func(e);
     }
 }
 
@@ -744,7 +737,7 @@ pub(crate) fn try_borrow_from_atomic_ptr_using_hazard_pointer<'a, T>(
         return Err(HazardBorrowErr::SlotFull);
     };
 
-    // About safety, see function doc.
+    // About safety, see module doc.
     membarrier2::light();
 
     // Why Acquire (instead of Relaxed): avoid reading uninitialized data from new pointer
@@ -764,6 +757,8 @@ pub(crate) fn try_borrow_from_atomic_ptr_using_hazard_pointer<'a, T>(
         }))
     } else {
         // this should be very rare, unless atomic pointer is changing frequently
+        std::hint::cold_path();
+
         let shared = curr_thread_shared_hazard_data();
         shared.store_relaxed(hazard_slot_index, null_mut());
         Err(HazardBorrowErr::PointerChanged)

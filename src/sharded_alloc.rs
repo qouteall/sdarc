@@ -1,10 +1,11 @@
 //! Structure of sharded alloc
 #![doc= include_str!("../docs/shard_alloc.drawio.svg")]
 
+use crate::collector::get_collector;
+use crate::curr_shard_index;
 use crate::env_params::disable_sharded_alloc_maintenance;
 use crate::shard_index::{
-    ShardIndex, ShardsArr, get_shard_count, shard_indexes,
-    shard_indexes_until,
+    ShardIndex, ShardsArr, get_shard_count, shard_indexes, shard_indexes_until,
 };
 use crossbeam_utils::CachePadded;
 use log::trace;
@@ -18,7 +19,6 @@ use std::ops::{DerefMut, Index, IndexMut, Not, Sub};
 use std::ptr::{NonNull, drop_in_place};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use crate::curr_shard_index;
 
 /// Each slot is 8 bytes (same size as `u64`).
 /// In mainstream platforms (X86-64 and ARM64), CachePadded use 128 alignment, which is 16 `u64`s.
@@ -69,9 +69,6 @@ impl AllocUnit {
         SLOT_COUNT_PER_UNIT * (1 + get_shard_count().as_usize()) * 8
     }
 
-    /// The `index_of_unit` will be used for deallocating.
-    ///
-    /// If it will never be deallocated, `index_of_unit` can be `usize::MAX`
     fn allocate_and_initialize<T: Send + Sync>(
         &self,
         init_func: impl Fn(ShardIndex) -> T,
@@ -141,7 +138,7 @@ impl AllocUnit {
         })
     }
 
-    fn is_any_slot_used(&self) -> bool {
+    fn is_any_slot_used_relaxed(&self) -> bool {
         self.usage_flag_atomics().any(|usage_flag| {
             let usage_flag_value = usage_flag.load(Ordering::Relaxed);
             Self::assert_usage_flag_value_valid(usage_flag_value);
@@ -149,7 +146,15 @@ impl AllocUnit {
         })
     }
 
-    fn has_any_free_slot(&self) -> bool {
+    fn is_any_slot_used_acquire(&self) -> bool {
+        self.usage_flag_atomics().any(|usage_flag| {
+            let usage_flag_value = usage_flag.load(Ordering::Acquire);
+            Self::assert_usage_flag_value_valid(usage_flag_value);
+            usage_flag_value == Self::USAGE_FLAG_USED
+        })
+    }
+
+    fn has_any_free_slot_relaxed(&self) -> bool {
         self.usage_flag_atomics().any(|usage_flag| {
             let usage_flag_value = usage_flag.load(Ordering::Relaxed);
             Self::assert_usage_flag_value_valid(usage_flag_value);
@@ -162,7 +167,7 @@ impl AllocUnit {
     }
 
     // just used for trace logging
-    fn get_unused_slot_count(&self) -> usize {
+    fn get_unused_slot_count_relaxed(&self) -> usize {
         self.usage_flag_atomics()
             .filter(|usage_flag| usage_flag.load(Ordering::Relaxed) == Self::USAGE_FLAG_UNUSED)
             .count()
@@ -171,7 +176,7 @@ impl AllocUnit {
 
 impl Drop for AllocUnit {
     fn drop(&mut self) {
-        assert!(self.is_any_slot_used().not());
+        assert!(self.is_any_slot_used_relaxed().not());
 
         unsafe {
             dealloc(self.data_ptr.as_ptr(), Self::get_layout());
@@ -225,12 +230,13 @@ impl AllocUnitGroup {
     }
 
     fn do_maintenance(&mut self) {
-        self.all_units.retain_mut(|unit| unit.is_any_slot_used());
+        self.all_units
+            .retain_mut(|unit| unit.is_any_slot_used_acquire());
 
         self.indexes_of_units_to_check_for_allocation.clear();
 
         for (i, unit) in self.all_units.iter().enumerate() {
-            if unit.has_any_free_slot() {
+            if unit.has_any_free_slot_relaxed() {
                 self.indexes_of_units_to_check_for_allocation.push(i);
             }
         }
@@ -240,7 +246,7 @@ impl AllocUnitGroup {
         let unused_slot_count: usize = self
             .all_units
             .iter()
-            .map(|unit| unit.get_unused_slot_count())
+            .map(|unit| unit.get_unused_slot_count_relaxed())
             .sum();
         let all_slot_count = self.all_units.len() * SLOT_COUNT_PER_UNIT;
 
@@ -390,7 +396,7 @@ pub(crate) fn total_sharded_alloc_used_slots() -> usize {
 
 /// It represents pointer to a piece of data in same offset in every shard.
 ///
-/// The data's size should be same as `u64`.
+/// The data's size should be same as or smaller than `u64`.
 #[derive(Debug)]
 pub(crate) struct ShardedDataPtr<T> {
     base_ptr: NonNull<u8>,
@@ -470,15 +476,16 @@ impl<T> ShardedDataPtr<T> {
         // Safety: caller ensures not dangling. and usage flag is never converted to mutable reference until dropping.
         let usage_flag: &AtomicU64 = unsafe { self.usage_flag_ptr().as_ref() };
 
-        // why use Release ordering: cannot use Relaxed because Relaxed allows delaying writes before deallocating to apply after deallocating.
-        // the allocation sets flag using Acquire which synchronizes-with it. no need to use SeqCst
+        // why use Release ordering:
+        // `do_maintenance` uses `is_any_slot_used_acquire` which also synchronizes-with it.
+        // Allocation swaps usage flag in Acquire under lock.
         let original_usage = usage_flag.swap(0, Ordering::Release);
         assert_eq!(
             original_usage, 1,
             "deallocated a slot whose usage flag was not set. free of dangling pointer"
         );
 
-        // It will only set usage flag. Other allocator maintenance work is done by background thread.
+        // It will only set usage flag. Actual memory freeing is done by collector thread in `do_maintenance`.
     }
 }
 
@@ -490,11 +497,20 @@ impl<T> ShardedDataPtr<T> {
 pub struct ShardedBox<T>(pub(crate) ShardedDataPtr<T>);
 
 impl<T: Send + Sync> ShardedBox<T> {
+    /// Creates a `ShardedBox`. The data of each shard will be initialized using `init_func`.
+    ///
+    /// Note: within the init_func, don't allocate new `ShardedBox` and don't create `Sdarc`,
+    /// otherwise it will deadlock.
     pub fn allocate_data_in_each_shard(init_func: impl Fn(ShardIndex) -> T) -> ShardedBox<T> {
         const { assert!(size_of::<T>() <= size_of::<u64>()) }
         const { assert!(align_of::<T>() <= align_of::<u64>()) }
 
         let ptr = FULL_SHARD_ALLOC.allocate_and_init(init_func);
+
+        // in case that someone only uses ShardedBox and don't use Sdarc, launch the collector,
+        // or it will never do maintenance then leak.
+        get_collector();
+
         Self(ptr)
     }
 

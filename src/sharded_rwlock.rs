@@ -10,7 +10,7 @@ use std::ops::{Deref, DerefMut};
 ///
 /// It makes read locking faster (lower contention) and write locking slower.
 ///
-/// It's similar to crossbeam [`crossbeam_utils::sync::sharded_lock::ShardedLock`]. Re-implement because
+/// It's similar to crossbeam [`crossbeam_utils::sync::ShardedLock`]. Re-implement because
 /// 1. allocate the lock shards using this library's sharded alloc. so having many `ShardedRwLocks` saves
 ///    memory compared to crossbeam `ShardedLock`
 /// 2. use parking_lot rwlock instead of std rwlock, which is usually faster and has no poison mechanism.
@@ -52,7 +52,7 @@ impl<T: Send + Sync> ShardedRwLock<T> {
     }
 
     pub fn write<'a>(&'a self) -> WriteGuardOfShardedRwLock<'a, T> {
-        // this loop cannot panic (parking_lot write doesn't panic), so no need to consider half-locked state
+        // parking_lot RwLock write won't panic unwind, so no need to consider half-locked state
         for shard_index in shard_indexes() {
             let lock_ref: &RwLock<()> = &self.locks[shard_index];
             let guard = lock_ref.write();

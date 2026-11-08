@@ -89,7 +89,7 @@ pub(crate) fn on_new_sdarc_allocated(
 
 static COLLECTOR: OnceLock<CollectorShared> = OnceLock::new();
 
-fn get_collector() -> &'static CollectorShared {
+pub(crate) fn get_collector() -> &'static CollectorShared {
     COLLECTOR.get_or_init(|| CollectorShared::new(CollectorParams::new_from_env_var()))
 }
 
@@ -163,7 +163,7 @@ impl TrackedCounter {
                 if relaxed_sum == 0 {
                     let sum = clear_tags_and_read_ref_count_sum_acquire(counters);
                     if sum == 0 {
-                        // counters tagged and observed sum is zero, going to re-check
+                        // observed sum is zero, tags cleared, going to re-check
                         self.state = TrackedCounterState::RequiresReChecking;
                     } else {
                         // The observed counter sum changed from 0 to nonzero.

@@ -1,9 +1,9 @@
 //! Stress test that can run in Miri.
 //!
-//! Exercises the same patterns as the full stress test — `Sdarc` clone/drop,
+//! Exercises `Sdarc` clone/drop,
 //! `AtomicSdarc` load/store/swap/borrow (hazard-pointer path), `WeakSdarc`
 //! downgrade/upgrade, cross-thread message passing, and short-lived child
-//! threads — but with `std::thread` only.
+//! threads.
 //!
 //! Instead of a single `AtomicSdarc`, the "cache database" is an array of
 //! slots that mixes `AtomicSdarc` and `AtomicNullableSdarc`. Slots are
@@ -190,9 +190,6 @@ struct SharedContext {
     spawns: AtomicU64,
     borrows: AtomicU64,
     invariant_ok: AtomicBool,
-
-    /// Stop signal.
-    stop: AtomicBool,
 }
 
 impl SharedContext {
@@ -211,7 +208,6 @@ impl SharedContext {
             spawns: AtomicU64::new(0),
             borrows: AtomicU64::new(0),
             invariant_ok: AtomicBool::new(true),
-            stop: AtomicBool::new(false),
         }
     }
 }
@@ -346,9 +342,6 @@ fn scenario_stress() {
             let mut generation: u64 = 0;
             let slot_count = updater_ctx.cache_slots.len();
             for _ in 0..UPDATER_ITERATIONS {
-                if updater_ctx.stop.load(Ordering::Relaxed) {
-                    break;
-                }
                 generation += 1;
                 let slot = &updater_ctx.cache_slots[rng.usize(slot_count)];
                 if slot.is_nullable() && rng.bool(15) {
@@ -380,9 +373,6 @@ fn scenario_stress() {
                     let mut rng = CheapRng::new((p + 100) as u64 * 0x9e3779b9);
                     let slot_count = ctx.cache_slots.len();
                     for _ in 0..PRODUCER_ITERATIONS {
-                        if ctx.stop.load(Ordering::Relaxed) {
-                            break;
-                        }
                         let slot = &ctx.cache_slots[rng.usize(slot_count)];
                         if let Some(cache) = slot.load_owned() {
                             if !cache.is_empty() {
@@ -417,9 +407,6 @@ fn scenario_stress() {
                     let slot_count = ctx.cache_slots.len();
                     let mut guards: Vec<AtomicSdarcBorrowGuard<'_, CacheMap>> = vec![];
                     for _ in 0..BORROWER_ITERATIONS {
-                        if ctx.stop.load(Ordering::Relaxed) {
-                            break;
-                        }
                         match rng.usize(10) {
                             // Borrow another guard from a random slot.
                             0..=4 => {
@@ -491,10 +478,6 @@ fn scenario_stress() {
 
                     barrier.wait();
                     for _iter in 0..WORKER_ITERATIONS {
-                        if ctx.stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-
                         // Drain inbox.
                         while let Ok(msg) = rx.try_recv() {
                             hand.push(msg);

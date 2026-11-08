@@ -450,8 +450,6 @@ fn drop_that_allocates_sdarc_cleans_up() {
     let counter = make_counter();
     let drop_counter = make_counter();
 
-    // Each DropAllocator's drop() creates+destroys 3 DropCounted referencing
-    // `drop_counter`.  The DropAllocator's own DropCounted references `counter`.
     {
         let container = Sdarc::new(DropAllocator::new(1, &counter, &drop_counter));
         let clones: Vec<_> = (0..5).map(|_| container.clone()).collect();

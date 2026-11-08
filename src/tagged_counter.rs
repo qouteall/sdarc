@@ -7,8 +7,8 @@
 //!
 //! For example, assume there are two shards. Firstly counters are [0, 1]:
 //! - Collector reads first counter, get 0
-//! - The `Sdarc` clones, increments second shard, now counters are [1, 1]
-//! - A `Sdarc` drops, decrements first shard, now counters are [1, 0]
+//! - The `Sdarc` clones, increments first shard, now counters are [1, 1]
+//! - A `Sdarc` drops, decrements second shard, now counters are [1, 0]
 //! - Collector reads second counter, get 0
 //! - Collector observed that the sum of counters is 0, but it's actually not zero. At that time, freeing is wrong.
 //!

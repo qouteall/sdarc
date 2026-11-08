@@ -104,6 +104,7 @@ pub fn shard_indexes_until(shard_index: ShardIndex) -> impl Iterator<Item = Shar
 
 /// A helper type that wraps heap-allocated slice so that you can use ShardIndex as index. The user no longer need to convert ShardIndex to usize.
 /// The elements will be contiguous in memory, unlike [`crate::sharded_alloc::ShardedBox`]
+/// (TODO make field private in 0.3)
 pub struct ShardsArr<T>(pub Box<[T]>);
 
 impl<T> ShardsArr<T> {
@@ -187,6 +188,8 @@ cfg_if::cfg_if! {
             use rand::RngExt;
             let value: u64 = rand::rng().random();
             ShardIndex::from_u64(value)
+            // TODO in TLS destruction, rand::rng() may panic.
+            // Postpone fix for now because miri is just used for testing.
         }
 
         pub const DOES_SHARD_INDEX_USE_CPU_INDEX: bool = false;

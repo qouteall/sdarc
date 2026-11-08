@@ -137,21 +137,6 @@ fn bench_atomic_read_throughput(c: &mut Criterion) {
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
     }
-
-    // In a X86 machine the Sdarc borrow is roughtly as fast as ArcSwap
-    // But in an ARM VM server the Sdarc borrow is faster than ArcSwap
-    // The Sdarc hazard pointer uses asymmetric fence to replace SeqCst while ArcSwap uses SeqCst
-    // The result in the ARM server
-    //
-    // AtomicSdarc borrow      time:   [1.7028 ms 1.7064 ms 1.7099 ms]
-    // Found 1 outliers among 50 measurements (2.00%)
-    //   1 (2.00%) high mild
-    //
-    // ArcSwap load            time:   [2.5046 ms 2.5126 ms 2.5216 ms]
-    // Found 4 outliers among 50 measurements (8.00%)
-    //   2 (4.00%) low mild
-    //   1 (2.00%) high mild
-    //   1 (2.00%) high severe
 }
 
 criterion_group! {

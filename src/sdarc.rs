@@ -244,7 +244,6 @@ impl<T> Drop for Sdarc<T> {
 /// It's type-erased thin ptr.
 ///
 /// It's thin ptr so it's not trivial to make Sdarc support variable-sized type.
-/// It's possible to support that, TODO.
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct SdarcInnerPtrErased(pub NonNull<u8>);
 
@@ -358,7 +357,8 @@ impl<T: Send + Sync> Sdarc<T> {
     pub fn estimate_weak_count(this: &Self) -> i64 {
         let inner = this.inner_ref();
         if let Some(w) = inner.weak_inner_ref.get() {
-            Sdarc::estimate_strong_count(w)
+            // Why subtract 1: `SdarcInner` holds the `Sdarc<WeakSdarcInner>`, which shouldn't be counted as weak count.
+            Sdarc::estimate_strong_count(w) - 1
         } else {
             0
         }
