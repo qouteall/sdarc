@@ -97,7 +97,8 @@ impl<'a, T> Drop for WriteGuardOfShardedRwLock<'a, T> {
 
             // recover the guard and drop it (avoid allocating a Vec to hold the guards)
             let _guard: RwLockWriteGuard<RawRwLock, ()> =
-                unsafe { lock_ref.make_write_guard_unchecked() };
+                unsafe { lock_ref.make_write_guard_unchecked(Default::default()) };
+            // The Default::default() is `GuardNoSend` (or `GuardSend` when parking_lot feature `send_guard` is enabled)
         }
     }
 }

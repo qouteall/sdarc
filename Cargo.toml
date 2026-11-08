@@ -15,10 +15,7 @@ license = "MIT OR Apache-2.0"
 cfg-if = "1"
 crossbeam-utils = "0.8"
 
-parking_lot = "0.12"
-# to run miri, use the parking_lot from github
-# parking_lot currently has no release since fixing https://github.com/Amanieu/parking_lot/issues/477
-#parking_lot = { git = "https://github.com/Amanieu/parking_lot", branch = "master" }
+parking_lot = "0.13"
 
 scopeguard = "1.2"
 log = "0.4"
